@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 // runner.cuh 中声明了 run_kernel 的函数签名
@@ -15,6 +16,7 @@
 //   尖括号搜索顺序：① -I 路径 → ② 系统默认路径（/usr/include 等），不搜索当前目录
 //   runner.cuh 在 src/ 下，已通过 target_include_directories(gemm PRIVATE src/) 加入 -I
 //   两种写法在此处效果相同，尖括号是惯例：表示"通过构建系统管理的路径"而非"相对路径的本地文件"
+#include <iomanip>
 #include <runner.cuh>
 #include <vector>
 
@@ -137,6 +139,7 @@ int main(int argc, char **argv) {
                        cudaMemcpyHostToDevice));
 
   int repeat_times = 50;
+
   for (int size : SIZE) {
     m = n = k = size;
 
@@ -196,7 +199,13 @@ int main(int argc, char **argv) {
           print_matrix(C, m, n, fs);
           fs << "Should:\n";
           print_matrix(C_ref, m, n, fs);
-          // fs 离开作用域时析构函数自动调用 close()，文件安全关闭
+          // 【RAII：资源生命周期与对象生命周期绑定】
+          // std::ofstream 是 RAII 类，离开 {} 作用域时析构函数自动调用 close()
+          // 刷新缓冲区（flush）并释放文件句柄，无需手动 fs.close()
+          //
+          // 适用范围：栈上对象（ofstream / ifstream / unique_ptr / lock_guard 等）
+          //   离开 {} 一定析构 → 资源一定释放
+          // 不适用：new / malloc 分配的堆内存，需手动 delete / free
         }
         // EXIT_FAILURE：标准宏，值为 1，表示程序异常退出
         // 验证失败直接终止，不继续跑 benchmark（结果没意义）
@@ -227,7 +236,7 @@ int main(int argc, char **argv) {
     // 严格写法应为 1000.f，全程 float 精度，避免隐式提升；此处精度差异可忽略
     elapsed_time /= 1000.;
 
-    // flo = 2*M*N*K：每个 C 元素需要 K 次乘法 + K 次加法 = 2K 次浮点运算，共 M*N 个元素
+    // floatPointOperations = 2*M*N*K：每个 C 元素需要 K 次乘法 + K 次加法 = 2K 次浮点运算，共 M*N 个元素
     // 用 long（64位）而非 int（32位）：
     //   m=n=k=4096 时，2*4096*4096*4096 ≈ 1.37×10¹¹，超出 int 上限（2.1×10⁹）
     //   用 int 会整数溢出，结果变为负数；long 上限 9.2×10¹⁸，可安全容纳
@@ -263,6 +272,83 @@ int main(int argc, char **argv) {
     // printf 默认行缓冲，数据可能积压在缓冲区，不立即显示
     // 每个 size 跑完后立即刷新，用户能实时看到每轮结果，而非等全部跑完才一次性输出
     fflush(stdout);
+
+    // std::string("kernel") + "_" + argv[1] + "_" + "result.txt"
+    // + 左结合，从左往右依次计算：
+    //   std::string("kernel") + "_"      → std::string  （string + const char*，OK）
+    //   结果                  + argv[1]  → std::string  （string + const char*，OK）
+    //   结果                  + "_"      → std::string  （string + const char*，OK）
+    //   结果                  + "result" → std::string  （string + const char*，OK）
+    // 只需第一个操作数是 std::string，后续每次 + 左侧已是 std::string，右侧 const char* 自动转换
+    // 若写 "kernel" + "_" 则是两个 const char* 相加，找不到 operator+，编译报错
+
+    // 本质：a + b 是 a.operator+(b) 的语法糖，编译器自动转换，运算符重载均如此
+    //
+    // std::string::operator+ 的实现（简化）：
+    //   成员函数版本（string + const char*）：
+    //     std::string operator+(const char* rhs) const {
+    //       std::string result = *this;   // 拷贝自身
+    //       result.append(rhs);           // 追加右侧
+    //       return result;
+    //     }
+    //   非成员函数版本（const char* + string，左侧是 const char* 时使用）：
+    //     定义在 std 命名空间，不属于任何类，没有 this 指针，不是静态成员函数
+    //     存在原因：成员函数 operator+ 只能处理 std::string + X（左侧必须是 std::string）
+    //               无法处理 "literal" + std::string（左侧是 const char*），需要非成员重载覆盖
+    //     直接用 lhs 构造结果再 append rhs，不是调换顺序后复用成员版本，两者是独立重载
+    //     std::string operator+(const char* lhs, const std::string& rhs) {
+    //       std::string result(lhs);   // 直接用 lhs 构造，不调换顺序
+    //       result.append(rhs);
+    //       return result;
+    //     }
+    const std::string resultDir = "benchmark_results";
+    // std::filesystem::create_directories：递归创建目录，已存在则不报错（幂等）
+    // 需要 C++17，CMakeLists.txt 中 set(CMAKE_CXX_STANDARD 17) 已满足
+    std::filesystem::create_directories(resultDir);
+    const std::string resultLogFile = resultDir + "/kernel" + argv[1] + "_result.txt";
+    std::ofstream fs;
+    // 第一个 size（SIZE 首元素）时覆盖旧文件，后续 size 追加写入同一文件
+    // std::ios::app（append）：每次写入都定位到文件末尾，不覆盖已有内容
+    // 不传 std::ios::app 时默认 std::ios::trunc，打开即清空文件
+    if (m == SIZE[0]) {
+      fs.open(resultLogFile);                        // 覆盖模式（trunc）
+      fs << "Running kernel ";
+      fs << kernel_num;
+      fs << " on device ";
+      fs << deviceIdx;
+      fs << ".\n";
+
+    } else {
+      fs.open(resultLogFile, std::ios::app);         // 追加模式
+    }
+
+    fs << "dimensions(m=n=k) ";
+    fs << m;  // 整型直接输出原始数字，std::fixed / std::setprecision 对整型无影响
+    fs << std::fixed << std::setprecision(2);
+    fs << ", alpha: ";
+    // 此处尚未设置 std::fixed / std::setprecision，使用流的默认格式：
+    //   格式：defaultfloat，自动选择定点或科学计数法中更紧凑的表示
+    //   精度：有效数字 6 位（不是小数位），末尾零省略
+    //   例：alpha=0.5 → 输出 "0.5"；alpha=0.000001 → 输出 "1e-06"
+    // std::fixed / std::setprecision 一旦设置持久生效，直到显式重置
+    // 此处写在设置之前，所以仍使用默认格式输出
+    fs << alpha;
+    fs << ", beta: ";
+    fs << beta;
+    fs << "\n";
+
+
+    fs << std::fixed << std::setprecision(6);
+    fs << "Average elapsed time: (";
+    fs << elapsed_time / repeat_times;
+    fs << ") s, performance: (";
+    fs << std::setprecision(1);
+    fs << flops;
+    fs << ") GFLOPS. size: (";
+    fs << m;
+    fs << ").\n";
+
+
     // beta=3.0 时 kernel 执行 C = 0.5*A×B + 3.0*C，不是完全覆盖而是累加，初值直接影响结果
     // 下一个 size 验证时：
     //   dC_ref = 0.5*A×B + 3.0*dC_ref_old

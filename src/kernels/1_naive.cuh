@@ -78,6 +78,18 @@ __global__ void gemm_naive(int M, int N, int K, float alpha, const float *A,
     //
     // 性能瓶颈在 A 和 C 的散乱访问，这也是此 kernel 称为 naive 的原因
     // kernel 2（global_mem_coalesce）通过调整线程与元素的映射关系解决此问题
+
+    // 【为什么不用一个线程处理一个乘积，存入 shared memory 再并行求和？】
+    // 方案：K 个线程各算一个乘积 A[x][i]*B[i][y]，再规约求和
+    // 问题1 - 规约需要 block 内同步（__syncthreads()），跨 block 无法同步：
+    //   K 可能达 4096，远超单 block 线程上限（1024），无法用一个 block 完成规约
+    // 问题2 - 改用 atomicAdd 跨线程累加：
+    //   atomicAdd(&C[x*N+y], A[x*K+i]*B[i*N+y])
+    //   K 个线程竞争写同一地址，强制串行化，比单线程循环更慢
+    // 正确优化方向（kernel 3 shared_mem_blocking）：
+    //   不是拆分乘法，而是 block 内线程协作将 A/B 的 tile 加载到 shared memory
+    //   多个线程复用同一份数据，减少 global memory 访问次数
+    //   并行的瓶颈在访存而非计算，优化目标是降低 global memory 访问量
     float tmp = 0.0;
     for (int i = 0; i < K; ++i) {
       tmp += A[x * K + i] * B[i * N + y];

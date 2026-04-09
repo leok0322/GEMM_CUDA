@@ -1,3 +1,14 @@
+// 12_kernel_double_buffering.cuh 的引用链路（间接 include）：
+//   runner.cu
+//     → #include "kernels.cuh"          （汇总头文件，集中 include 所有 kernel）
+//         → #include "kernels/12_kernel_double_buffering.cuh"
+//
+// 预处理器按链路依次展开，最终 12_kernel_double_buffering.cuh 的内容
+// 原地粘贴进 runner.cu 的翻译单元，编译器看到的是一个合并后的完整文件
+//
+// CMakeLists.txt 中 target_include_directories(gemm PRIVATE ... ${PROJECT_SOURCE_DIR}/src)
+// 的作用正是让预处理器能正确找到 "kernels.cuh"（位于 src/）以及其中的 "kernels/xxx.cuh"
+// 等价于编译命令追加 -I/path/to/src，缺少此路径则 #include "kernels.cuh" 会报找不到文件
 #include "kernels.cuh"
 #include "runner.cuh"
 #include <cmath>
@@ -119,17 +130,41 @@ void copy_matrix(const float *src, float *dest, int N) {
     printf("copy failed at %d while there are %d elements in total.\n", i, N);
 }
 
+// 将行主序一维数组 A（M×N 矩阵）以可读格式写入文件流 fs
+// 输出格式类似 MATLAB/numpy：
+//   [ 1.23,  4.56;       ← 第 0 行，; 表示行结束
+//     7.89,  0.12]       ← 最后一行，] 表示矩阵结束
+// std::ofstream &fs：引用传参，避免拷贝，直接操作调用方的文件流
 void print_matrix(const float *A, int M, int N, std::ofstream &fs) {
-  int i;
+  // C89 风格：变量必须在函数开头声明，不能在 for 里声明
+  // 现代 C++ 写法应为 for(int i = 0; ...)，作用域限制在循环内，更安全
+  // int i;
+  // std::setprecision(2)：设置浮点数有效位数为 2 位小数
+  // std::fixed：固定小数点格式（如 3.14），而非科学计数法（如 3.14e+00）
+  // 这两个是 io 操纵符（manipulator），只影响流（stream）的 << 输出格式，设置后持续生效
+  //   不影响变量本身的值、printf 格式、普通赋值和计算
+  //   本质是修改流对象内部的格式状态，与数据无关
   fs << std::setprecision(2)
-     << std::fixed; // Set floating-point precision and fixed notation
+     << std::fixed;
   fs << "[";
-  for (i = 0; i < M * N; i++) {
+  // 按行主序遍历一维数组，i 从 0 到 M*N-1
+  for (int i = 0; i < M * N; i++) {
+    // std::setw(5)：设置下一个输出项的最小字段宽度为 5
+    //   单位是字符数（字符个数），不足 5 个字符时左侧补空格对齐
+    //   例：3.14 → " 3.14"（1个空格+4个字符=5），-3.14 → "-3.14"（恰好5个字符）
+    //   超过 5 个字符时不截断，按实际宽度输出
+    // 注意：setw 只对紧跟的下一次输出生效，不像 setprecision 持续有效
     if ((i + 1) % N == 0)
-      fs << std::setw(5) << A[i]; // Set field width and write the value
+      // (i+1) % N == 0：当前元素是该行最后一个，行尾不加逗号
+      fs << std::setw(5) << A[i];
     else
+      // 非行尾元素：写值后加 ", " 分隔
       fs << std::setw(5) << A[i] << ", ";
+
     if ((i + 1) % N == 0) {
+      // 行尾处理：除最后一行外，写 ";\n" 表示行结束（MATLAB 风格）
+      // i+1 < M*N：还有下一行，写分号换行
+      // i+1 == M*N：最后一行，不写分号，由循环外的 "]" 收尾
       if (i + 1 < M * N)
         fs << ";\n";
     }
@@ -137,12 +172,55 @@ void print_matrix(const float *A, int M, int N, std::ofstream &fs) {
   fs << "]\n";
 }
 
+// 对比自写 kernel 输出（matOut）与 cuBLAS 参考结果（matRef）逐元素验证正确性
 bool verify_matrix(float *matRef, float *matOut, int N) {
+  // diff 用 double 而非 float：两个 float 相减可能损失精度，double 中间计算更准确
   double diff = 0.0;
   int i;
   for (i = 0; i < N; i++) {
+    // std::fabs()：取浮点数绝对值，在 <cmath> 中有三个重载版本：
+    //   float       std::fabs(float)
+    //   double      std::fabs(double)
+    //   long double std::fabs(long double)
+    //   编译器在编译期根据参数类型选择对应的重载版本（此处参数为 float，选 float 版本）
+    //   这是函数重载（overload）而非函数模板（template）：
+    //     函数重载：多份独立实现，不同类型可有不同底层指令
+    //     函数模板：一份代码自动实例化，逻辑必须相同
+    //   float/double/long double 底层浮点指令不同，故用重载而非模板
+
+
+    //   C 风格的 fabsf() 只接受 float、fabs() 只接受 double，类型写死不够灵活
+    //   cmath 中 float 版本的实际实现：
+    //     inline _GLIBCXX_CONSTEXPR float fabs(float x) { return __builtin_fabsf(x); }
+    // #ifndef __CORRECT_ISO_CPP_MATH_H_PROTO
+    // // 条件编译守卫，防止与 C 的 math.h 中的 fabs 定义冲突
+    // // 只在符合 ISO C++ 标准的环境下才启用这套重载
+    //
+    // inline
+    // // 建议编译器将函数体直接展开到调用处，避免函数调用开销
+    // // 对于这种极简函数（只有一行），inline 几乎必然被采纳
+    //
+    // _GLIBCXX_CONSTEXPR
+    // // GCC 标准库的宏，展开为 constexpr
+    // // 表示此函数可在编译期求值（如 constexpr float x = fabs(-1.0f)）
+    //
+    // __builtin_fabsf(__x)
+    // // __builtin_* 是 GCC 内置函数（builtin），不是普通 C/C++ 函数
+    // // 编译器直接将其翻译为硬件浮点指令，如 x86 的 FABS 或 SSE 的 ANDPS
+    // // 没有函数调用，没有跳转，性能最优
+    // // （x86: ANDPS/FABS），无函数调用开销，cmath 只是薄薄的包装层，实现在编译器内部
+
+    // 不能直接比较 matRef[i] == matOut[i]：浮点运算存在舍入误差，完全相等几乎不可能
+    // 改为比较绝对误差：|matRef[i] - matOut[i]| < 0.01 视为正确
     diff = std::fabs(matRef[i] - matOut[i]);
+    // isnan(diff)：检测 NaN（kernel 计算出现除零、溢出等非法结果时产生）
+    // diff > 0.01：误差超过阈值，认为结果发散
     if (isnan(diff) || diff > 0.01) {
+      // %5.2f：浮点格式说明符，% 起始，5 总宽度（不足左补空格），.2 小数点后2位，f 浮点数
+      //   作用：三列数字宽度一致，对齐排列，便于对比阅读
+      //   例：Should  3.14, Is  3.17 (Diff  0.03)
+      // %d：十进制整数格式说明符，输出出错元素的下标 i
+      // \n：转义字符，表示换行，与 %d 无关，是独立的字符串转义
       printf("Divergence! Should %5.2f, Is %5.2f (Diff %5.2f) at %d\n",
              matRef[i], matOut[i], diff, i);
       return false;
@@ -158,9 +236,34 @@ int div_ceil(int numerator, int denominator) {
 
 void runCublasFP32(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // cuBLAS uses column-major order. So we change the order of our row-major A &
-  // B, since (B^T*A^T)^T = (A*B)
-  // This runs cuBLAS in full fp32 mode
+  // cuBLAS 内部使用列主序（column-major），而本项目矩阵是行主序（row-major）
+  // 行主序的 A(M×K) 在列主序视角下等价于 A^T(K×M)，直接传入会算错
+  // 利用转置等价公式绕过：(A×B)^T = B^T × A^T
+  //   列主序下计算 B^T × A^T，等价于行主序下计算 A × B
+  //   实现方式：交换 A/B 的传入顺序，将 N/M 对调，cuBLAS 内部自动处理转置
+  //
+  // cublasGemmEx 函数签名（简化）：
+  //   cublasStatus_t cublasGemmEx(
+  //     cublasHandle_t handle,
+  //     cublasOperation_t transa,  // 对第一个矩阵的操作：CUBLAS_OP_N=不转置
+  //     cublasOperation_t transb,  // 对第二个矩阵的操作：CUBLAS_OP_N=不转置
+  //     int m,                     // 第一个矩阵的行数（列主序视角）→ 传 N
+  //     int n,                     // 第二个矩阵的列数（列主序视角）→ 传 M
+  //     int k,                     // 内维度
+  //     const void *alpha,         // 缩放系数 α（传指针）
+  //     const void *A,             // 第一个矩阵 → 传 B（交换顺序）
+  //     cudaDataType_t Atype,      // 第一个矩阵数据类型：CUDA_R_32F = float32
+  //     int lda,                   // leading dimension：列主序下第一个矩阵的行数 → 传 N
+  //     const void *B,             // 第二个矩阵 → 传 A（交换顺序）
+  //     cudaDataType_t Btype,      // 第二个矩阵数据类型：CUDA_R_32F = float32
+  //     int ldb,                   // leading dimension：列主序下第二个矩阵的行数 → 传 K
+  //     const void *beta,          // 缩放系数 β（传指针）
+  //     void *C,                   // 输出矩阵
+  //     cudaDataType_t Ctype,      // 输出矩阵数据类型：CUDA_R_32F = float32
+  //     int ldc,                   // leading dimension：输出矩阵的行数 → 传 N
+  //     cublasComputeType_t computeType, // 计算精度：CUBLAS_COMPUTE_32F = 全程 float32
+  //     cublasGemmAlgo_t algo      // 算法选择：CUBLAS_GEMM_DEFAULT_TENSOR_OP = 自动选最优
+  //   )
   cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
                N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -577,6 +680,23 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
                 "BN*BK must be a multiple of 4*256 to vectorize loads");
 
   dim3 gridDim(CEIL_DIV(N, K12_BN), CEIL_DIV(M, K12_BM));
+  // 【模板惰性实例化（Template Lazy Instantiation）与编译警告 #20054-D 的关系】
+  //
+  // 12_kernel_double_buffering.cuh 中使用了：
+  //   static __shared__ cuda::barrier<...> frontBarrier;
+  //   static __shared__ cuda::barrier<...> backBarrier;
+  //
+  // nvcc 对此发出警告 #20054-D：
+  //   "static" is not allowed on a __shared__ variable declared in a function template
+  //   （在函数模板中声明的 __shared__ 变量不允许使用 static）
+  //
+  // 但如果注释掉下面这行调用，警告就消失了。原因是 C++ 的模板惰性实例化：
+  //   - 模板函数（如 runSgemmDoubleBuffering2<...>）在定义时不会被编译
+  //   - 只有当代码中出现具体的调用（实例化点）时，编译器才会为该模板生成实际代码
+  //   - 没有调用 → 没有实例化 → 编译器从不处理模板体内的语句 → 不触发任何警告
+  //
+  // 对比普通函数：普通函数定义即编译，无论是否被调用，警告都会出现
+  // 模板函数：按需编译，注释掉唯一的调用点，等价于让整段模板代码从未存在
   runSgemmDoubleBuffering2<K12_BM, K12_BN, K12_BK, K12_WM, K12_WN, K12_WNITER,
                            K12_TM, K12_TN, K12_NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
@@ -625,6 +745,12 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     runSgemmDoubleBuffering2(M, N, K, alpha, A, B, beta, C);
     break;
   default:
+    // throw：抛出异常，中断当前函数执行，沿调用栈向上传播，直到被 catch 捕获
+    // std::invalid_argument：C++ 标准异常类（继承自 std::logic_error → std::exception）
+    //   表示传入参数不合法，构造函数接受一个描述字符串，可通过 e.what() 获取
+    // 本项目 main() 中没有 try-catch，异常未被捕获会触发 std::terminate() 终止程序
+    // 实际上 main() 已经在入口处校验了 kernel_num 范围（0-12），正常流程不会走到这里
+    // 此处作为防御性编程的最后一道保障，防止 run_kernel 被其他地方以非法参数调用
     throw std::invalid_argument("Unknown kernel number");
   }
 }

@@ -23,15 +23,14 @@ project(GEMM_CUDA LANGUAGES CXX CUDA)
 #   - 记录每个源文件的完整编译命令（include 路径、宏定义、编译标志等）
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# find_package(CUDA REQUIRED) —— 传统 FindCUDA 模块（CMake 3.10 前的方式，现已 legacy）
+# find_package(CUDAToolkit REQUIRED) —— 现代 CMake 方式（CMake 3.17+）
 #   - 在系统中搜索 CUDA Toolkit，找不到则报错终止（REQUIRED）
-#   - 成功后自动定义以下变量供后续使用：
-#       CUDA_INCLUDE_DIRS       : CUDA 头文件路径（如 /usr/local/cuda/include）
-#       CUDA_LIBRARIES          : 核心运行时库（libcudart）
-#       CUDA_CUBLAS_LIBRARIES   : cuBLAS 库（libcublas）
-#       CUDA_VERSION            : 探测到的 CUDA 版本号
-#   - 现代替代方案：find_package(CUDAToolkit REQUIRED)，变量名为 CUDAToolkit_*
-#     但本项目沿用传统方式，与下方 target_link_libraries 中的变量名保持一致
+#   - 成功后提供现代 IMPORTED target，直接用于 target_link_libraries：
+#       CUDA::cudart   : CUDA 运行时库（libcudart）
+#       CUDA::cublas   : cuBLAS 库（libcublas）
+#       CUDA::cublasLt : cuBLAS Lt 库
+#   - 相比旧式 find_package(CUDA)，变量名更规范，路径查找更可靠
+#     旧式在新版 CUDA（12+）上 CUDA_CUBLAS_LIBRARIES 可能为空，导致链接报错
 find_package(CUDAToolkit REQUIRED)
 
 # include(CheckLanguage)：加载 CMake 内置模块，引入 check_language() 函数
@@ -110,9 +109,17 @@ message(STATUS "检测到 GPU Compute Capability: ${_GPU_CC} -> CUDA_ARCHITECTUR
 #                  用途①：cuda-gdb 读取行号映射，断点处可显示 .cu 源码而非裸 PTX
 #                  用途②：手动读 PTX 文件时，直接看到每条指令对应哪行源码，无需对照翻找
 #                  注意：需与 -G 配合；单独使用时优化器重排导致行号映射不准，意义不大
+#                  已移除：PTX 格式只支持 ASCII，源文件含中文注释时 ptxas 报错
 #
 # 整体语义：仅在 Debug 模式编译 CUDA 文件时附加这两个标志，Release 模式不受影响
-add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G;-src-in-ptx>")
+# 注意：-src-in-ptx 已移除
+#   原因：-src-in-ptx 将源码行以注释形式嵌入 PTX 文件，但 PTX 格式规范只支持 ASCII
+#   源文件中含中文注释时，ptxas 解析 PTX 会报：
+#     "ptxas fatal: Unexpected non-ASCII character encountered"
+#   PTX 没有编码配置选项，是 NVIDIA 的格式限制，无法绕过
+#   去掉 -src-in-ptx 后只保留 -G，cuda-gdb 调试仍可用，只损失 PTX 中嵌入源码行的功能
+#add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G;-src-in-ptx>")
+add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G>")
 
 # --ptxas-options=-v：让 ptxas（PTX 汇编器）输出每个 kernel 的资源使用统计：
 #   - 寄存器数（registers）：影响 GPU 占用率（occupancy）
@@ -131,6 +138,10 @@ add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G;-src-i
 #   - 收集所有"可编译源文件"后缀（.cu .cpp .c .cc 等），不包含 .h / .hpp / .cuh
 #     头文件不需要独立编译，只在被 #include 时参与编译，CMake 自动排除
 #   - 若目录下有不想编译的源文件需手动排除
+#
+# 何时需要重新运行 cmake（Reload Project）：
+#   需要 ：修改 CMakeLists.txt、新增/删除源文件、修改编译器或架构配置
+#   不需要：只修改已有 .cu / .cpp / .cuh 文件内容，直接 make 重新编译即可
 #   - 现代 CMake 更推荐显式列出源文件（避免意外编译不相关文件），此处为简化管理而使用
 # 使用现代 CMake 的 target_include_directories，仅对指定 target 生效，避免全局污染
 aux_source_directory(${PROJECT_SOURCE_DIR}/src SRC)
@@ -157,29 +168,21 @@ add_executable(gemm gemm.cu ${SRC})
 #               若其他 target 链接了 gemm，这些路径不会传递过去
 #               对应还有 PUBLIC（自身+传递）和 INTERFACE（仅传递，自身不用）
 #
-#   ${CUDA_INCLUDE_DIRS}          : CUDA 头文件目录（如 /usr/local/cuda/include）
-#                                   使源文件可以 #include <cuda_runtime.h> / <cublas_v2.h> 等
-#   ${PROJECT_SOURCE_DIR}/src     : 项目 src/ 目录，使 gemm.cu 可以 #include "kernel.cuh" 等
-#                                   本地 kernel 头文件放在 src/ 下时必须加此路径
-target_include_directories(gemm PRIVATE ${CUDA_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR}/src)
+#   ${CUDAToolkit_INCLUDE_DIRS} : CUDA 头文件目录（如 /usr/local/cuda/include）
+#                                  使源文件可以 #include <cuda_runtime.h> / <cublas_v2.h> 等
+#头文件路径由 CUDA::cudart / CUDA::cublas 的 IMPORTED target 自动携带，无需手动指定，这里显式设置
+#   ${PROJECT_SOURCE_DIR}/src   : 项目 src/ 目录，使 gemm.cu 可以 #include "kernel.cuh" 等
+#                                  本地 kernel 头文件放在 src/ 下时必须加此路径
+target_include_directories(gemm PRIVATE ${CUDAToolkit_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR}/src)
 # target_link_libraries(<target> <库1> [库2 ...])
-# 告诉链接器（ld）在链接 gemm 时附加以下动态库（等价于 -lcudart -lcublas）
+# 使用现代 IMPORTED target，CMake 自动处理头文件路径、库路径、依赖关系
 #
-#   ${CUDA_LIBRARIES}        : libcudart.so —— CUDA 运行时库，提供：
-#                                cudaMalloc / cudaFree（设备内存管理）
-#                                cudaMemcpy（Host <-> Device 数据传输）
-#                                kernel 启动调度、流/事件管理等
-#   ${CUDA_CUBLAS_LIBRARIES} : libcublas.so —— cuBLAS 线性代数库，提供：
-#                                cublasSgemm 等 GPU 矩阵运算函数
-#                                本项目用于与自写 kernel 做性能对比
-#
-# 一定要加吗？
-#   - ${CUDA_LIBRARIES}（libcudart）：
-#       理论上 nvcc 链接时会自动附加 libcudart，但显式写明更可靠，
-#       换用 find_package(CUDAToolkit) 的现代写法时也必须显式指定
-#   - ${CUDA_CUBLAS_LIBRARIES}（libcublas）：
-#       必须加，nvcc 不会自动链接 cuBLAS；不加会在链接阶段报 undefined reference to cublasSgemm
-target_link_libraries(gemm ${CUDA_LIBRARIES} ${CUDA_CUBLAS_LIBRARIES})
+#   CUDA::cudart : libcudart.so —— CUDA 运行时库
+#                  cudaMalloc / cudaFree / cudaMemcpy / kernel 启动调度等
+#   CUDA::cublas : libcublas.so —— cuBLAS 线性代数库
+#                  cublasGemmEx 等 GPU 矩阵运算函数，必须显式链接
+#                  不加会报：undefined reference to cublasCreate_v2 / cublasGemmEx
+target_link_libraries(gemm CUDA::cudart CUDA::cublas)
 
 # 以上三条指令等价的手动命令行（以架构 86、Release 模式为例）：
 #
@@ -209,9 +212,9 @@ add_executable(cuBLAS_gemm cuBLAS_gemm.cu)
 #set_target_properties(cuBLAS_sgemm PROPERTIES CUDA_ARCHITECTURES 86)
 #等价于给 nvcc 传递：
 #-gencode arch=compute_86,code=[sm_86,compute_86]
-target_include_directories(cuBLAS_gemm PRIVATE ${CUDA_INCLUDE_DIRS})
-target_link_libraries(cuBLAS_gemm ${CUDA_LIBRARIES} ${CUDA_CUBLAS_LIBRARIES})
+target_include_directories(cuBLAS_gemm PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(cuBLAS_gemm CUDA::cudart CUDA::cublas)
 
 add_executable(simplest_kernel simplest_kernel.cu)
-target_include_directories(simplest_kernel PRIVATE ${CUDA_INCLUDE_DIRS})
-target_link_libraries(simplest_kernel ${CUDA_LIBRARIES})
+target_include_directories(simplest_kernel PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(simplest_kernel CUDA::cudart)

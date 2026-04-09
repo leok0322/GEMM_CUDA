@@ -10,6 +10,10 @@
 // 的作用正是让预处理器能正确找到 "kernels.cuh"（位于 src/）以及其中的 "kernels/xxx.cuh"
 // 等价于编译命令追加 -I/path/to/src，缺少此路径则 #include "kernels.cuh" 会报找不到文件
 #include "kernels.cuh"
+// runner.cu 包含自己的头文件 runner.cuh，目的是让编译器做自洽性检查：
+//   runner.cuh 中是函数声明（declaration），runner.cu 中是函数定义（definition）
+//   同时 include 后，若定义的参数类型或返回值与声明不一致，编译时立即报错
+//   若不包含，runner.cu 能正常编译，但声明与定义的不匹配只能在链接阶段才能发现，更难调试
 #include "runner.cuh"
 #include <cmath>
 #include <cstdio>

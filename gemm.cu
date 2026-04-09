@@ -9,6 +9,12 @@
 // 链接阶段 ld 扫描所有 .o 的符号表，在 runner.cu.o 中找到 run_kernel 的实现，
 // 将其真实地址回填到 gemm.cu.o 中所有调用处，完成重定位（relocation）
 // 这依赖 CMakeLists.txt 中 add_executable(gemm gemm.cu ${SRC}) 把 runner.cu 也纳入同一 target
+//
+// 使用尖括号 <runner.cuh> 而非双引号 "runner.cuh"：
+//   双引号搜索顺序：① 当前源文件所在目录 → ② -I 路径 → ③ 系统默认路径（/usr/include 等）
+//   尖括号搜索顺序：① -I 路径 → ② 系统默认路径（/usr/include 等），不搜索当前目录
+//   runner.cuh 在 src/ 下，已通过 target_include_directories(gemm PRIVATE src/) 加入 -I
+//   两种写法在此处效果相同，尖括号是惯例：表示"通过构建系统管理的路径"而非"相对路径的本地文件"
 #include <runner.cuh>
 #include <vector>
 
@@ -56,10 +62,23 @@ int main(int argc, char **argv) {
   // print some device info
   // CudaDeviceInfo();
 
-  // Declare the handle, create the handle, cublasCreate will return a value of
-  // type cublasStatus_t to determine whether the handle was created
-  // successfully (the value is 0)
+  // cublasHandle_t：cuBLAS 库的上下文句柄，本质是一个不透明指针（opaque pointer）
+  //   typedef struct cublasContext* cublasHandle_t;
+  //   内部 cublasContext 结构体由 cuBLAS 库管理，用户不直接访问，包含：
+  //     - 当前绑定的 CUDA stream（默认 stream 0）
+  //     - 当前 GPU 设备信息
+  //     - 工作区内存（workspace）指针
+  //     - 数学模式（math mode）：CUBLAS_DEFAULT_MATH / CUBLAS_TENSOR_OP_MATH 等
+  //     - 原子操作模式、日志设置等
+  //   所有 cuBLAS API 调用都需要传入此 handle，类似 OpenGL 的上下文
   cublasHandle_t handle;
+
+  // cublasCreate 函数签名：cublasStatus_t cublasCreate(cublasHandle_t *handle)
+  //   - 参数：cublasHandle_t* 指针，函数内部分配 cublasContext 并将地址写入 handle
+  //   - 返回：cublasStatus_t 枚举，CUBLAS_STATUS_SUCCESS=0 表示成功，非 0 表示失败
+  //   - 内部操作：初始化 cuBLAS 库、分配 GPU 资源、绑定当前 CUDA 设备
+  //   - if(cublasCreate(&handle))：返回非 0（失败）时进入错误处理，0（成功）不进入
+  //   - 对应销毁：程序结束前需调用 cublasDestroy(handle) 释放资源
   if (cublasCreate(&handle)) {
     std::cerr << "Create cublas handle error." << std::endl;
     exit(EXIT_FAILURE);
@@ -126,12 +145,30 @@ int main(int argc, char **argv) {
     // Verify the correctness of the calculation, and execute it once before the
     // kernel function timing to avoid cold start errors
     if (kernel_num != 0) {
-      run_kernel(0, m, n, k, alpha, dA, dB, beta, dC_ref,
-                 handle); // cuBLAS
-      run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC,
-                 handle); // Executes the kernel, modifies the result matrix
-      cudaCheck(cudaDeviceSynchronize());
-      cudaCheck(cudaGetLastError()); // Check for async errors during kernel run
+      try {
+        run_kernel(0, m, n, k, alpha, dA, dB, beta, dC_ref,
+                   handle); // cuBLAS
+        // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+        cudaCheck(cudaGetLastError());
+        run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC,
+                   handle); // Executes the kernel, modifies the result matrix
+        // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+        cudaCheck(cudaGetLastError());
+        // 再等待 GPU 执行完毕，捕获 kernel 运行时的异步错误
+        // 若顺序反过来，cudaDeviceSynchronize 会消费掉异步错误，cudaGetLastError 可能漏报
+        cudaCheck(cudaDeviceSynchronize());
+      } catch (const std::exception &e) {
+        // run_kernel 的 default 分支会 throw std::invalid_argument
+        // 未捕获时触发 std::terminate()，输出系统错误信息，不友好
+        // 捕获后打印可读错误信息并干净退出，更优雅
+        //
+        // catch(const std::exception &e)：
+        //   std::exception 是所有标准异常的基类，捕获基类引用可接住所有标准异常
+        //   const &：引用避免拷贝，const 保证不修改异常对象
+        //   e.what()：虚函数，多态调用到具体子类实现，返回异常描述字符串
+        printf("%s\n", e.what());
+        exit(EXIT_FAILURE);
+      }
       cudaMemcpy(C, dC, sizeof(float) * m * n, cudaMemcpyDeviceToHost);
       cudaMemcpy(C_ref, dC_ref, sizeof(float) * m * n, cudaMemcpyDeviceToHost);
 
@@ -140,10 +177,17 @@ int main(int argc, char **argv) {
             << "Failed to pass the correctness verification against NVIDIA "
                "cuBLAS."
             << std::endl;
+        // 矩阵太大时打印到终端不现实，只对小矩阵（m<=128）写入文件便于调试
         if (m <= 128) {
           std::cout << " Logging faulty output into " << errLogFile << "\n";
+          // std::ofstream：输出文件流，用于写文件
+          // fs.open(errLogFile)：打开 errLogFile（"matrixValidationFailure.txt"）
+          //   默认以覆盖模式（trunc）打开，每次验证失败都会覆盖上次内容
           std::ofstream fs;
           fs.open(errLogFile);
+          // << 运算符：将字符串/矩阵内容写入文件，与 std::cout 用法相同
+          // 依次写入 A、B、kernel 输出 C、cuBLAS 参考结果 C_ref
+          // 便于对比：看 A、B 的输入是什么，kernel 算出什么，正确结果应该是什么
           fs << "A:\n";
           print_matrix(A, m, n, fs);
           fs << "B:\n";
@@ -152,31 +196,80 @@ int main(int argc, char **argv) {
           print_matrix(C, m, n, fs);
           fs << "Should:\n";
           print_matrix(C_ref, m, n, fs);
+          // fs 离开作用域时析构函数自动调用 close()，文件安全关闭
         }
+        // EXIT_FAILURE：标准宏，值为 1，表示程序异常退出
+        // 验证失败直接终止，不继续跑 benchmark（结果没意义）
         exit(EXIT_FAILURE);
       }
     }
 
     cudaEventRecord(beg);
     for (int j = 0; j < repeat_times; j++) {
-      // We don't reset dC between runs to save time
-      run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC, handle);
+      try {
+        // We don't reset dC between runs to save time
+        run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC, handle);
+        // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+        cudaCheck(cudaGetLastError());
+      } catch (const std::exception &e) {
+        // 注意：此 catch 只能捕获 run_kernel 内 throw 的 C++ 异常（如非法 kernel 编号）
+        // CUDA 错误由 cudaCheck 内部调用 exit() 处理，不经过异常机制，catch 捕获不到
+        // benchmark 循环中捕获后仅打印不退出，循环继续但 elapsed_time 已包含异常帧的时间
+        printf("%s\n", e.what());
+      }
     }
+
     cudaEventRecord(end);
-    cudaEventSynchronize(beg);
     cudaEventSynchronize(end);
     cudaEventElapsedTime(&elapsed_time, beg, end);
-    elapsed_time /= 1000.; // Convert to seconds
+    // cudaEventElapsedTime 返回毫秒，除以 1000 转换为秒
+    // 1000. 是 double 字面量，elapsed_time(float) 会隐式提升为 double 再除，结果截断回 float
+    // 严格写法应为 1000.f，全程 float 精度，避免隐式提升；此处精度差异可忽略
+    elapsed_time /= 1000.;
 
-    long flops = 2 * m * n * k;
+    // flo = 2*M*N*K：每个 C 元素需要 K 次乘法 + K 次加法 = 2K 次浮点运算，共 M*N 个元素
+    // 用 long（64位）而非 int（32位）：
+    //   m=n=k=4096 时，2*4096*4096*4096 ≈ 1.37×10¹¹，超出 int 上限（2.1×10⁹）
+    //   用 int 会整数溢出，结果变为负数；long 上限 9.2×10¹⁸，可安全容纳
+    //   m/n/k 也声明为 long，确保乘法运算全程在 long 精度下进行，不会中途溢出
+    long floatPointOperations = 2 * m * n * k;
+
+    // 列表初始化 {} 禁止窄化转换（narrowing conversion），这是它与 = 初始化的核心区别。
+    //
+    //   表达式的类型推导：
+    //   (repeat_times * floatPointOperations * 1e-9) / elapsed_time
+    //   //  int       *  long               * double  →  double
+    //   //                                             / float → double
+    //   // 最终结果是 double
+    //
+    //   double → long 是窄化转换（有精度损失），{} 直接拒绝，编译报错。
+    //
+    //   = 初始化允许窄化：
+    //   long flops = (repeat_times * floatPointOperations * 1e-9) / elapsed_time;
+    //   // double → long，隐式截断，编译通过但有精度损失
+    double flops {(repeat_times * floatPointOperations * 1e-9) / elapsed_time};
+    // %7.6f：float/double 格式，总宽7，小数6位（elapsed_time/repeat_times 为 float）
+    // %7.1f：float/double 格式，总宽7，小数1位（flops 为 double）
+    //   %f 对应 double 而非 float：printf 是可变参数函数，传入 float 会触发
+    //   默认参数提升（default argument promotion），自动提升为 double
+    //   因此 %f 和 %lf 在 printf 中等价（scanf 中必须区分，%f→float* %lf→double*）
+    // %ld：long 类型整数（m 为 long）
     printf(
         "Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. size: "
         "(%ld).\n",
         elapsed_time / repeat_times,
-        (repeat_times * flops * 1e-9) / elapsed_time, m);
+        flops, m);
+    // fflush(stdout)：强制刷新标准输出缓冲区，将缓冲区内容立即写入终端
+    // printf 默认行缓冲，数据可能积压在缓冲区，不立即显示
+    // 每个 size 跑完后立即刷新，用户能实时看到每轮结果，而非等全部跑完才一次性输出
     fflush(stdout);
-    // make dC and dC_ref equal again (we modified dC while calling our kernel
-    // for benchmarking)
+    // beta=3.0 时 kernel 执行 C = 0.5*A×B + 3.0*C，不是完全覆盖而是累加，初值直接影响结果
+    // 下一个 size 验证时：
+    //   dC_ref = 0.5*A×B + 3.0*dC_ref_old
+    //   dC     = 0.5*A×B + 3.0*dC_污染值   ← 若不还原，dC_污染值≠dC_ref_old，验证必然失败
+    // 还原后 dC==dC_ref，两者初值相同，验证结果才可比较
+    // 若 beta=0 则初值无影响（C=0.5*A×B），无需还原
+    // cudaMemcpyDeviceToDevice：全程在 GPU 内存间拷贝，不经过 CPU
     cudaCheck(cudaMemcpy(dC, dC_ref, sizeof(float) * m * n,
                          cudaMemcpyDeviceToDevice));
   }

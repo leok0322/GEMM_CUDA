@@ -344,11 +344,22 @@ void run_gemm_naive(int M, int N, int K, float alpha, float *A, float *B,
   gemm_naive<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-void run_sgemm_coalesce(int M, int N, int K, float alpha, float *A, float *B,
+void run_gemm_coalesce(int M, int N, int K, float alpha, float *A, float *B,
                         float beta, float *C) {
+  // blockDim(32*32=1024)：每个 block 1024 个线程，1D 排列
+  // 模板参数 <32> 即 BLOCKSIZE=32，kernel 内用 /32 和 %32 将 threadIdx.x 映射为 2D 坐标
+  //   threadIdx.x / 32 → block 内行偏移，范围 0~31，共 32 行
+  //   threadIdx.x % 32 → block 内列偏移，范围 0~31，共 32 列
+  // 因此每个 block 恰好覆盖 C 的一个 32×32 tile（32行 × 32列 = 1024个元素）
+  //
+  // gridDim(CEIL_DIV(M,32), CEIL_DIV(N,32))：
+  //   x 方向 CEIL_DIV(M,32) 个 block，覆盖所有 M 行
+  //   y 方向 CEIL_DIV(N,32) 个 block，覆盖所有 N 列
+  //   grid 内所有 block 的 tile 拼合后覆盖整个 M×N 的 C 矩阵
+  //   超出实际矩阵范围的线程由 kernel 内 if(cRow<M && cCol<N) 过滤
   dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
   dim3 blockDim(32 * 32);
-  sgemm_global_mem_coalesce<32>
+  gemm_global_mem_coalesce<32>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
@@ -716,7 +727,7 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     run_gemm_naive(M, N, K, alpha, A, B, beta, C);
     break;
   case 2:
-    run_sgemm_coalesce(M, N, K, alpha, A, B, beta, C);
+    run_gemm_coalesce(M, N, K, alpha, A, B, beta, C);
     break;
   case 3:
     run_sgemm_shared_mem_block(M, N, K, alpha, A, B, beta, C);

@@ -119,7 +119,20 @@ message(STATUS "检测到 GPU Compute Capability: ${_GPU_CC} -> CUDA_ARCHITECTUR
 #   PTX 没有编码配置选项，是 NVIDIA 的格式限制，无法绕过
 #   去掉 -src-in-ptx 后只保留 -G，cuda-gdb 调试仍可用，只损失 PTX 中嵌入源码行的功能
 #add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G;-src-in-ptx>")
+
+
 add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G>")
+# -lineinfo：Release 模式下保留源码行号信息，让 ncu（NVIDIA Nsight Compute）能将性能数据对应回源码行
+#   ncu 是独立的外部分析工具，在构建系统之外运行：ncu ./build/gemm 2
+#   不需要在 CMakeLists.txt 中集成 ncu 本身，只需保证编译产物含行号信息
+#
+#   与 -G 的区别：
+#     -G（Debug）  ：完整调试信息 + 禁止优化，配合 cuda-gdb 调试用
+#                    ncu 在 Debug 下测出的性能是未优化代码的结果，无参考价值
+#     -lineinfo    ：仅保留行号，不禁止优化，Release 下 ncu 分析才能反映真实性能
+#
+#   因此：Debug 用 -G，Release + ncu 性能分析用 -lineinfo，两者分工不同
+add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-lineinfo>")
 
 # --ptxas-options=-v：让 ptxas（PTX 汇编器）输出每个 kernel 的资源使用统计：
 #   - 寄存器数（registers）：影响 GPU 占用率（occupancy）
@@ -144,6 +157,8 @@ add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G>")
 #   不需要：只修改已有 .cu / .cpp / .cuh 文件内容，直接 make 重新编译即可
 #   - 现代 CMake 更推荐显式列出源文件（避免意外编译不相关文件），此处为简化管理而使用
 # 使用现代 CMake 的 target_include_directories，仅对指定 target 生效，避免全局污染
+
+
 aux_source_directory(${PROJECT_SOURCE_DIR}/src SRC)
 
 # add_executable(<target> <source1> [source2 ...])：声明一个可执行文件 target
@@ -158,6 +173,8 @@ aux_source_directory(${PROJECT_SOURCE_DIR}/src SRC)
 #   step1 - nvlink（设备链接）：合并各 .o 中的 GPU 代码，生成 device_linked.o
 #   step2 - ld（主机链接）   ：将所有 .o + device_linked.o + 各 .so 链接为最终可执行文件
 # nvcc 作为驱动器（driver）按序调用 nvlink 和 ld，CMake 检测到 .cu 源文件时自动选择 nvcc 驱动
+
+
 add_executable(gemm gemm.cu ${SRC})
 # CUDA_ARCHITECTURES 继承自 CMAKE_CUDA_ARCHITECTURES，无需手动指定
 #
@@ -174,6 +191,8 @@ add_executable(gemm gemm.cu ${SRC})
 #   ${PROJECT_SOURCE_DIR}/src   : 项目 src/ 目录，使 gemm.cu 可以 #include "kernel.cuh" 等
 #                                  本地 kernel 头文件放在 src/ 下时必须加此路径
 target_include_directories(gemm PRIVATE ${CUDAToolkit_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR}/src)
+
+
 # target_link_libraries(<target> <库1> [库2 ...])
 # 使用现代 IMPORTED target，CMake 自动处理头文件路径、库路径、依赖关系
 #

@@ -90,10 +90,11 @@ __global__ void gemm_naive(int M, int N, int K, float alpha, const float *A,
     //   不是拆分乘法，而是 block 内线程协作将 A/B 的 tile 加载到 shared memory
     //   多个线程复用同一份数据，减少 global memory 访问次数
     //   并行的瓶颈在访存而非计算，优化目标是降低 global memory 访问量
-    float tmp = 0.0;
+    float temp {};  // 或者  float temp = 0.0f;
     for (int i = 0; i < K; ++i) {
-      tmp += A[x * K + i] * B[i * N + y];
+      temp += A[x * K + i] * B[i * N + y];
     }
+
     // GEMM 标准公式：C = α*(A@B) + β*C
     //   缩放的意义：通过调整 alpha/beta 让一个函数覆盖多种运算，避免多次 kernel 调用
     //   alpha  beta   等价操作
@@ -104,6 +105,6 @@ __global__ void gemm_naive(int M, int N, int K, float alpha, const float *A,
     //   性能意义：GPU 访存代价极高，合并"乘+缩放+叠加"进一次 kernel，
     //   比分步计算少读写两次 C 矩阵，显著减少 global memory 访问
     //   这也是 cuBLAS cublasSgemm 的参数语义
-    C[x * N + y] = alpha * tmp + beta * C[x * N + y];
+    C[x * N + y] = alpha * temp + beta * C[x * N + y];
   }
 }

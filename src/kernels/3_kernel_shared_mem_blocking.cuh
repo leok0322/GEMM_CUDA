@@ -63,8 +63,22 @@ __global__ void gemm_shared_mem_block(int M, int N, int K, float alpha,
                                        float beta, float *C) {
 
   // ── 确定本 block 负责 C 矩阵的哪个 tile ────────────
-  // gridDim.x 对应 M（行）方向，gridDim.y 对应 N（列）方向
+  // gridDim.x = CEIL_DIV(M,32)（行方向），gridDim.y = CEIL_DIV(N,32)（列方向）
   // 本 block 负责 C[cRow*BS..(cRow+1)*BS-1][cCol*BS..(cCol+1)*BS-1]
+  //
+  // 【为什么 blockIdx.x 可以对应行，而 threadIdx.x 必须对应列？】
+  //
+  // threadIdx.x 必须对应列（N方向）——硬件强制：
+  //   warp 内线程按 x 优先线性化：linear_id = threadIdx.x + threadIdx.y * blockDim.x
+  //   同一 warp 内 threadIdx.x = 0..31 连续变化，threadIdx.y 不动
+  //   内存行主序下，coalesced 访问要求 warp 内线程访问同一行连续地址
+  //   → threadIdx.x 必须映射到列方向，否则访存不连续
+  //
+  // blockIdx.x 可以自由对应行（M方向）——无约束：
+  //   block 之间没有 warp 这类硬件约束，blockIdx 排列顺序不影响任何 warp 内部的访存模式
+  //   block(0,0) 和 block(1,0) 是独立执行单元，各自内部的 coalesced 由 threadIdx 决定
+  //   blockIdx.x 赋予行还是列，对 coalesced 无任何影响，纯粹是命名惯例
+  //   gridDim 只决定 block 的数量和范围，对 threadIdx 的排列没有任何影响
   const uint cRow = blockIdx.x;
   const uint cCol = blockIdx.y;
 

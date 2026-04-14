@@ -19,6 +19,12 @@
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
+#include "error_check.cuh"
+
+
+#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))  // 需要在cudaCheck定义之后才能定义宏
+
+
 
 float get_sec() {
   struct timeval time;
@@ -28,21 +34,7 @@ float get_sec() {
 
 float cpu_elapsed_time(float &beg, float &end) { return 1.0e-6 * (end - beg); }
 
-// cudaCheck 是项目自定义的错误检查函数，配合 gemm.cu 中的宏：
-//   #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-// 每次 CUDA API 调用后自动传入源文件名和行号，方便定位出错位置
-void cudaCheck(cudaError_t error, const char *file, int line) {
-  // cudaSuccess 是枚举值 0，所有 CUDA API 成功时返回此值
-  if (error != cudaSuccess) {
-    // cudaGetErrorString(error)：将 cudaError_t 枚举值转为可读字符串
-    //   如 cudaErrorMemoryAllocation -> "out of memory"
-    //      cudaErrorInvalidDevice    -> "invalid device ordinal"
-    // 若不调用此函数，error 只是一个整数，无法直观看出错误原因
-    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
-           cudaGetErrorString(error));
-    exit(EXIT_FAILURE);
-  }
-};
+
 
 void CudaDeviceInfo() {
   int deviceId;
@@ -342,6 +334,8 @@ void run_gemm_naive(int M, int N, int K, float alpha, float *A, float *B,
   //   例：M=N=1024 -> gridDim=(32,32)，总线程数=1024×1024=C 矩阵元素总数
   dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
   gemm_naive<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+  cudaCheck(cudaGetLastError());
 }
 
 void run_gemm_coalesce(int M, int N, int K, float alpha, float *A, float *B,
@@ -361,23 +355,460 @@ void run_gemm_coalesce(int M, int N, int K, float alpha, float *A, float *B,
   dim3 blockDim(32 * 32);
   gemm_global_mem_coalesce<32>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+  cudaCheck(cudaGetLastError());
 }
 
-void run_sgemm_shared_mem_block(int M, int N, int K, float alpha, float *A,
-                                float *B, float beta, float *C) {
+
+
+void run_gemm_shared_mem_block(int M, int N, int K, float alpha, float *A,
+                                float *B, float beta, float *C, int deviceIdx, bool& record) {
   dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
   dim3 blockDim(32 * 32);
-  // L1 cache becomes useless, since we access GMEM only via SMEM, so we carve
-  // out all of L1 to SMEM. This doesn't currently make a difference, since
-  // occupancy is limited by reg and thread count, but it's good to do anyway.
-  cudaFuncSetAttribute(sgemm_shared_mem_block<32>,
-                       cudaFuncAttributePreferredSharedMemoryCarveout,
-                       cudaSharedmemCarveoutMaxShared);
-  sgemm_shared_mem_block<32>
+
+
+  cudaDeviceProp deviceProp {};
+  cudaCheck(cudaGetDeviceProperties_v2(&deviceProp, deviceIdx));
+
+  cudaFuncAttributes funcAttributes {};
+  // reinterpret_cast<const void*>：强制将 __global__ 函数符号转换为 const void*
+  // cudaFuncGetAttributes 的第二个参数类型是 const void*，需要显式转换
+
+  // gemm_shared_mem_block<32> 是设备端符号（device symbol），不是普通函数指针：
+  //   不是普通函数指针void(*)(int, int, int, float, const float*, const float*, float, float*)
+  //   CUDA 编译器给 __global__ 函数赋予了一个特殊的不透明类型，不是标准 C++ 函数指针。ReSharper 因此显示为 __resharper_unknown_type
+  //   编译后成为设备端符号表中的一个条目，主机端持有的是指向该符号的句柄
+  //   CUDA 运行时通过此句柄在设备显存中查找 kernel 实际入口地址
+  //   不能用 cudaGetSymbolAddress 获取（那是给 __device__ 变量用的，不适用于 __global__ 函数：
+  //      __device__ float d_data[1024];
+  //      void* ptr;
+  //      cudaGetSymbolAddress(&ptr, d_data);  // ✓ 获取设备端变量地址
+  //   GPU 函数地址在设备显存中，与 CPU 地址空间隔离，CUDA 故意不暴露实际地址
+
+  // 为什么不能用 static_cast<const void*>：
+  //   static_cast 要求类型之间有标准定义的转换关系
+  //   函数指针 → void* 在 C++ 标准中不是合法的 static_cast 转换
+  //   即使是普通函数指针 void(*)(int,...) 也同样不能 static_cast 为 void*：
+  //     void foo(int){}; static_cast<void*>(foo)  → 编译错误
+  //     reinterpret_cast<void*>(foo)               → 合法
+  //   函数指针和数据指针（void*）在 C++ 标准中属于完全不同的类型体系，static_cast 无法跨越
+
+  // reinterpret_cast 可以：
+  //   强制重新解释指针的二进制表示，不检查类型关系
+  //   C 风格转换 (const void*) 在此场景等价于 reinterpret_cast，两者均可
+  //   CUDA 文档要求用此方式传入 kernel 函数地址
+  cudaCheck(cudaFuncGetAttributes(&funcAttributes, reinterpret_cast<const void*>(gemm_shared_mem_block<32>)));
+
+  if (record) {
+    std::string fileNme {"benchmark_results/kernel_3_properties.txt"};
+    std::ofstream file;
+    file.open(fileNme);
+
+    file << "defore cudaFuncSetAttribute,\n";
+    file << "device properties are listed as below: \n";
+    file << "deviceProp.sharedMemPerMultiprocessor: ";
+    // 运算优先级：/ 和 << 都是二元运算符，/ 优先级（5）高于 <<（7，按 C++ 标准数字越小越高）
+    // 因此 deviceProp.sharedMemPerMultiprocessor / (1<<10) 先算除法，再输出到 file
+    // (1<<10) = 1 * 2^10 = 1024，整除后得到 KiB 数值
+    // 括号是必须的：若写 1<<10 而不加括号，<< 会被解析为流插入运算符，语义完全错误
+    //   file << x / 1 << 10  →  (file << (x/1)) << 10  →  先输出 x，再输出整数 10，结果错误
+    // 加括号后：file << (x / (1<<10))  →  先计算 1<<10=1024，再除，再输出，正确
+    file << deviceProp.sharedMemPerMultiprocessor / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "deviceProp.reservedSharedMemPerBlock: ";
+    file << deviceProp.reservedSharedMemPerBlock / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "deviceProp.sharedMemPerBlock: ";
+    file << deviceProp.sharedMemPerBlock / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "deviceProp.sharedMemPerBlockOptin: ";
+    file << deviceProp.sharedMemPerBlockOptin  / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "deviceProp.regsPerBlock: ";
+    file << deviceProp.regsPerBlock;
+    file << "\n";
+    file << "deviceProp.regsPerMultiprocessor: ";
+    file << deviceProp.regsPerMultiprocessor;
+    file << "\n\n";
+    file << "kernel_3 properties are listed as below: \n";
+    file << "funcAttributes.sharedSizeBytes: ";
+    file << funcAttributes.sharedSizeBytes / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "funcAttributes.maxDynamicSharedSizeBytes: ";
+    file << funcAttributes.maxDynamicSharedSizeBytes / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "funcAttributes.preferredShmemCarveout: ";
+    file << funcAttributes.preferredShmemCarveout;
+    file << "\n";
+    file << "funcAttributes.localSizeBytes: ";
+    file << funcAttributes.localSizeBytes;
+    file << "\n";
+    file << "funcAttributes.numRegs: ";
+    file << funcAttributes.numRegs;
+    file << "\n\n";
+
+
+    // ════════════════════════════
+    // 【cudaFuncSetAttribute 详解：编译期 vs 运行期，两个属性的作用与关系】
+    //
+    // ── 背景：SM 上的三类片上资源 ─────────
+    //
+    //   GPU 的每个 SM（Streaming Multiprocessor）上有三类片上资源，总量由硬件固定：
+    //
+    //   ① 寄存器（Register File）
+    //      总量由 deviceProp.regsPerMultiprocessor 决定（典型值 65536 个 32-bit 寄存器）
+    //      分配粒度：线程级别（每线程需要多少寄存器由编译器静态分析决定）
+    //
+    //      一个线程占用多个寄存器的情况：
+    //        kernel 中每个局部变量、中间计算结果都需要一个寄存器存放
+    //        例如：
+    //          float a = A[i];        // 1 个寄存器存 a
+    //          float b = B[i];        // 1 个寄存器存 b
+    //          float acc = 0.0f;      // 1 个寄存器存累加器
+    //          float tmp = a * b;     // 编译器可能复用，也可能再分配 1 个
+    //        kernel_3 的 ptxas 输出：Used 31 registers
+    //        → 每个线程同时持有 31 个寄存器，block 内 1024 个线程共占
+    //          31 × 1024 = 31744 个寄存器
+    //        → SM 有 65536 个寄存器，最多容纳 floor(65536/31744) = 2 个 block 并发
+    //        寄存器是占用率（occupancy）的主要瓶颈之一：
+    //          每线程寄存器越多 → 单 block 消耗越大 → SM 能并发的 block 越少
+    //          这也是高级 kernel 做"寄存器 tiling"（register tiling）的动机：
+    //          把更多中间结果放在寄存器而非反复读 SMEM，以计算换访存，
+    //          但需权衡寄存器增多导致的 occupancy 下降
+    //      不够时：spill 到 Local Memory（每线程私有，物理上是 HBM 的一段地址，
+    //              经 L1/L2 cache，延迟从 0 cycles 上升到 100~300+ cycles）
+    //      编译时可见，kernel_3 实际 ptxas 输出：
+    //        ptxas info: Used 31 registers, used 1 barriers, 8192 bytes smem, 400 bytes cmem[0]
+    //        ptxas info: 0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+    //
+    //        Used 31 registers：每线程使用 31 个寄存器
+    //          由编译器静态分析所有局部变量、中间计算结果后确定
+    //          影响 occupancy：31 × 1024（线程/block）= 31744 个寄存器/block
+    //                         SM 共 65536 个 → 最多 floor(65536/31744) = 2 个 block 并发
+    //
+    //        used 1 barriers：kernel 内使用了 1 次 __syncthreads()
+    //          barrier 是 block 内所有线程的同步点，确保 shared memory 加载完成后再计算
+    //          barrier 数量也是编译期静态确定的资源，影响 SM 调度
+    //
+    //        8192 bytes smem：单个 block 的静态 shared memory 用量 = 8 KiB
+    //          对应 kernel_3 中两个 __shared__ tile：
+    //            __shared__ float As[32][32]  = 32*32*4 = 4096 bytes
+    //            __shared__ float Bs[32][32]  = 32*32*4 = 4096 bytes
+    //            合计 = 8192 bytes = 8 KiB
+    //          以单个 block 为单位统计，每个 block 启动时固定占用此量
+    //          SM 上同时运行 N 个 block，物理 SMEM 消耗 = N × 8192 bytes
+    //          即 funcAttributes.sharedSizeBytes 的值
+    //
+    //        400 bytes cmem[0]：constant memory 用量
+    //          cmem[0] 是 constant memory bank 0，专门存放 kernel 函数参数
+    //          kernel 参数（M, N, K, alpha, beta, 指针等）在调用时由驱动自动打包写入
+    //          所有线程读同一个地址时硬件广播，零额外开销
+    //
+    //        0 bytes stack frame：GPU 栈帧为 0
+    //          GPU kernel 不应有递归或动态大小的局部数组，否则需要栈空间
+    //          栈帧非 0 会显著降低性能（需要额外内存分配）
+    //
+    //        0 bytes spill stores / 0 bytes spill loads：无寄存器溢出
+    //          spill stores：寄存器不够，将数据写出到 Local Memory 的字节数
+    //          spill loads ：后续从 Local Memory 读回的字节数
+    //          两者均为 0 说明 31 个寄存器完全够用，无溢出，性能最优
+    //
+    //   ② Shared Memory（SMEM）
+    //      与 L1 Cache 共享同一块片上 SRAM，两者按比例切分
+    //      分配粒度：block 级别（每个 block 占用固定量，SM 上多个 block 共用总量）
+    //      不够时：kernel launch 失败（cudaErrorInvalidConfiguration），不是运行时崩溃
+    //      编译时可见：ptxas 输出 "N bytes smem"（静态部分）
+    //
+    //   ③ L1 Cache
+    //      与 Shared Memory 共享同一块片上 SRAM，由驱动/设置决定比例
+    //      Local Memory 的 spill 数据也走 L1 缓存（localL1CacheSupported=1 时）
+    //
+    //   三类资源共同决定 occupancy（SM 上能并发的 warp 数 / 理论最大 warp 数）：
+    //     floor(regsPerMultiprocessor / (每线程寄存器数 × block线程数))
+    //     floor(sharedMemPerMultiprocessor / 每个block的smem用量)
+    //     硬件 block 数上限（sm_86 = 16）
+    //   以上三个约束取最严格的，就是实际能并发的 block 数
+
+
+    // ── 四个字段的性质总结 ──────────────────────────────────────────────────
+    //
+    //   字段                               性质        含义
+    //   ─────────────────────────────────────────────────────────────────────
+    //   sharedMemPerMultiprocessor         硬件上限    SM 物理 SRAM 最大可给 SMEM 的量
+    //                                                  （carveout=100% 时）
+    //   funcAttributes.maxDynamicSharedSizeBytes 软件上限  kernel 被允许申请的 dynamic SMEM 上限
+    //                                                  不是实际占用，是申请配额的天花板
+    //   sharedMemPerBlock                  软件默认值  不 opt-in 时的保守上限（历史兼容值）
+    //                                                  与物理分区无关，任何设置都不会改变它
+    //   funcAttributes.sharedSizeBytes     真实占用    编译器静态确定的 __shared__ 变量大小
+    //                                                  每个 block 启动时的实际物理占用量
+    //   ─────────────────────────────────────────────────────────────────────
+    //   注：dynamic SMEM 的真实占用 = <<<>>> 第三个参数实际传入值（本 kernel = 0）
+    //       L1 大小无法通过以上任何字段直接读取，只能由 ncu profiler 间接观测
+    //
+    // ── deviceProp 中 shared memory 相关字段（硬件固定，任何调用都不会改变）──
+    //
+    //   deviceProp.sharedMemPerMultiprocessor = 100 KiB（本机 sm_86）
+    //     硬件上限：SM 物理 SRAM 在 carveout=100% 时全部给 SMEM 的最大量
+    //     不反映当前实际 L1/SMEM 分区，设置 carveout=MaxL1 后此值仍为 100 KiB
+    //
+    //   deviceProp.sharedMemPerBlock = 48 KiB
+    //     软件默认值：不调用 cudaFuncSetAttribute 时单 block 的 SMEM 上限
+    //     保守的历史兼容值，与物理分区无关，任何设置都不会改变它
+    //
+    //   deviceProp.sharedMemPerBlockOptin = 99 KiB
+    //     opt-in 路径下单 block 的 SMEM 理论上限
+    //     主动申请后（见下文）才能突破 48 KiB 默认值，不能超过此值
+    //
+    //   deviceProp.reservedSharedMemPerBlock = 1 KiB
+    //     系统/驱动保留的 SMEM，不对用户代码开放
+    //     实际可用 = sharedMemPerBlockOptin - reservedSharedMemPerBlock = 98 KiB
+    //
+    // ── cudaFuncAttributes 中相关字段（per-kernel运行时属性，可被修改）────
+    //
+    //   funcAttributes.sharedSizeBytes = 8 KiB（本 kernel）
+    //     真实占用：编译期由 ptxas 静态确定的 __shared__ 变量大小
+    //     每个 block 启动时固定占用此量，是唯一能直接反映物理 SMEM 占用的字段
+    //     ptxas 输出：Used N registers, M bytes smem ← M 就是 sharedSizeBytes
+    //
+    //   funcAttributes.maxDynamicSharedSizeBytes
+    //     软件上限：kernel 被允许通过 <<<grid, block, dynamicSmem>>> 申请的动态 SMEM 上限
+    //     不是实际占用——kernel_3 第三个参数缺省(=0)，实际动态占用 = 0，不是 40/90 KiB
+    //     默认值 = sharedMemPerBlock - sharedSizeBytes = 48 - 8 = 40 KiB
+    //     可通过 cudaFuncAttributeMaxDynamicSharedMemorySize 提升到最多 91 KiB（见下）
+    //
+    //   funcAttributes.preferredShmemCarveout
+    //     偏好请求：希望从 SM 片上 SRAM 中分给 SMEM 的百分比（0~100）
+    //     -1 = cudaSharedmemCarveoutDefault（驱动决定）
+    //     100 = cudaSharedmemCarveoutMaxShared（SMEM 最大，L1 最小）
+    //     注：sm_86（Ampere）默认就已经是 100，驱动策略即为最大化 SMEM
+    //     carveout 的实际效果是黑盒，CUDA 没有提供查询接口。这也是它被称为 preferred（偏好）而非 required（强制）的原因之一——驱动保留了忽略请求的权利，外部无法验证。
+
+
+
+    // ── 编译期 vs 运行期 ───────────
+    //
+    //   编译期（ptxas 阶段）：
+    //     静态分析 kernel 代码，确定 sharedSizeBytes / 寄存器数 / barrier 数
+    //     写入 .cubin 元数据，不做任何实际分配
+    //     示例输出：
+    //       ptxas info: Used 31 registers, used 1 barriers, 8192 bytes smem, 400 bytes cmem[0]
+    //       ptxas info: 0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+    //     spill=0 说明寄存器够用，无溢出
+    //
+    //   运行期（kernel 启动时）：
+    //     驱动读取编译期元数据 + cudaFuncSetAttribute 的设置
+    //     检查 SM 上是否有足够资源，有则调度 block，无则 block 等待
+    //     cudaFuncSetAttribute 是纯运行期概念，对编译结果零影响
+
+
+    // cudaFuncAttributeMaxDynamicSharedMemorySize 和 cudaFuncAttributePreferredSharedMemoryCarveout
+    // ── funcAttributes.cudaFuncAttributeMaxDynamicSharedMemorySize ──────────
+    //
+    //   作用：将 maxDynamicSharedSizeBytes 从默认 40 KiB 提升，突破 sharedMemPerBlock 限制
+    //   性质：硬性申请，驱动必须保证；失败时返回 CUDA 错误（必须 cudaCheck 才能发现）
+    //   上限约束：dynamic + static ≤ sharedMemPerBlockOptin
+    //     动态申请上限 = sharedMemPerBlockOptin - sharedSizeBytes = 99 - 8 = 91 KiB
+    //     sharedMemPerBlockOptin = 99 KiB（硬件 opt-in 上限，单 block 总 SMEM 天花板）
+    //     sharedSizeBytes        =  8 KiB（静态 __shared__ 已占用）
+    //     剩余可动态申请上限     = 91 KiB（reservedSharedMemPerBlock 已包含在 sharedMemPerBlockOptin 内）
+    //   设置 96*1024：96 + 8 = 104 KiB > 99 KiB → 超出上限，CUDA 拒绝，返回错误
+    //   设置 91*1024：91 + 8 =  99 KiB ≤ 99 KiB → 合法，maxDynamicSharedSizeBytes = 91 KiB（理论最大值）
+    //   设置 90*1024：90 + 8 =  98 KiB ≤ 99 KiB → 合法，maxDynamicSharedSizeBytes = 90 KiB（当前设置，略保守）
+    //   不调用此函数：maxDynamicSharedSizeBytes 维持默认 40 KiB，
+    //                 <<<>>> 如果传入 >40 KiB 会触发 cudaErrorInvalidConfiguration
+    //
+    // ── funcAttributes.cudaFuncAttributePreferredSharedMemoryCarveout ───────
+    //
+    //   作用：纯粹的性能调优 hint，唯一实际影响的是 L1 cache 的物理大小
+    //   性质：偏好提示（preferred），驱动可忽略；不影响任何容量上限
+
+    //
+    //   驱动的决策逻辑（三步）：
+    //     1. 先保证 kernel 能运行（static + dynamic SMEM 需求是硬性约束，必须满足）
+    //     2. 在此前提下，按 carveout 偏好分配剩余空间给 L1
+    //     3. carveout 是 preferred，驱动可因其他约束（如同 SM 上其他 kernel）而偏离
+    //
+    //   物理分区示意（sm_86 总 SRAM = 128 KiB）：
+    //     carveout = MaxShared (100%)：SMEM ≈ 100 KiB，L1 ≈  28 KiB（最小）
+    //     carveout = MaxL1    (  0%)：SMEM = 满足 kernel 实际需求（最小，如 8 KiB），
+    //                                 L1 ≈ 120 KiB（剩余尽可能多）
+    //     → 核心逻辑："在满足 SMEM 需求的前提下，把剩余空间尽量给 L1"
+    //
+    //   carveout 影响什么（性能层面）：
+    //     L1 越大 → global memory 访问命中率越高 → 依赖 L1 自动缓存的 kernel 受益
+    //     SMEM 分区越大 → SM 上并发 block 的 SMEM 物理容量越充足 → occupancy 越高
+    //
+    //   carveout 不影响什么：
+    //     maxDynamicSharedSizeBytes（软件配额，只有 MaxDynamicSharedMemorySize 能改）
+    //     sharedMemPerBlock（历史软件默认值，与物理分区完全无关）
+    //     kernel 能否 launch（由 maxDynamicSharedSizeBytes 决定，不由 carveout 决定）
+    //     → 实验验证：carveout=MaxL1 时 maxDynamicSharedSizeBytes 依然是 90 KiB，kernel 正常运行
+    //
+    //   常见误解：当 carveout=MaxShared 且 maxDynamic=40 KiB 时，
+    //     误以为 L1 = sharedMemPerMultiprocessor(100) - maxDynamic(40) - static(8) = 52 KiB
+    //     （即把软件字段当物理空间来扣减）
+    //
+    //     错误原因一：maxDynamicSharedSizeBytes 是软件申请上限，不是物理占用量
+    //       kernel_3 启动时第三个参数缺省（=0），实际 dynamic SMEM 物理占用 = 0，不是 40 KiB
+    //       物理占用（per block）= static(8 KiB) + dynamic实际传入(0 KiB) = 8 KiB
+    //
+    //     错误原因二：L1/SMEM 物理分区的决定机制
+    //       sharedMemPerMultiprocessor = 100 KiB 同样是硬件上限，不是实际分配值
+    //
+    //       实际分区由两步决定：
+    //         第一步：确定 SMEM 的"地板"（硬性约束，必须满足，与 carveout 无关）
+    //           地板 = (sharedSizeBytes + dynamic实际传入) × SM上并发block数
+    //           kernel_3：(8 KiB + 0 KiB) × 2 块 = 16 KiB
+    //           注意：dynamic"实际传入"= <<<>>> 第三个参数值，不是 maxDynamicSharedSizeBytes
+    //                 maxDynamicSharedSizeBytes=40 KiB 是软件上限，不影响物理地板
+    //
+    //         第二步：carveout 决定"地板以上的剩余空间"如何分配
+    //           carveout=MaxShared → 剩余空间尽量给 SMEM，L1 取最小值
+    //           carveout=MaxL1    → 剩余空间尽量给 L1，SMEM 只保留地板
+    //
+    //       只能推算范围（精确值无法通过 CUDA API 读取，需 ncu profiler 观测）：
+    //         SM 总 SRAM         = 128 KiB（硬件固定）
+    //         SMEM 物理分区      ≤ 100 KiB（carveout=MaxShared 时趋近上限）
+    //         L1  物理分区       ≥  28 KiB（= 128 - 100，最小保留量）
+    //
+    //   sm_86 特殊情况：
+    //     Ampere 驱动默认 carveout 已是 100，初始值就是 100（非其他架构的 -1）
+    //     设置 MaxShared 是空操作；设置 MaxL1 理论上减少 L1，但对本 kernel 无影响
+    //
+    //   为什么 kernel_3 设置 carveout 没有可观测效果：
+    //     kernel_3 所有 global memory 数据都经由 __shared__ 手动管理，
+    //     计算热循环完全不走 L1 自动缓存，L1 大小对结果和性能无影响
+    //     原始注释："This doesn't currently make a difference,
+    //                since occupancy is limited by reg and thread count"
+    //     保留此调用是跨架构最佳实践：Pascal/Volta 默认 carveout 非 100，
+    //     不设置则物理 SMEM 分区可能不足，影响 occupancy
+    //
+    // ── 两个属性的关系与协作 ────────
+    //
+    //   MaxDynamicSharedMemorySize（软件层面，per-kernel 申请配额）：
+    //     类比：向 OS 申请 ulimit，决定"kernel 被允许申请多少"
+    //     不设置：最多 40 KiB dynamic，超过则 kernel launch 失败
+    //     设置后：最多 90 KiB dynamic，可在 <<<>>> 第三个参数传入大 SMEM
+    //
+    //   PreferredSharedMemoryCarveout（硬件层面，SM 资源分区偏好）：
+    //     类比：告诉 OS "我偏好大页内存"，决定"SM 如何划分物理 SRAM"
+    //     不设置（sm_86 默认已 100）：SM 物理 SRAM 已尽量分给 SMEM
+    //     设置后：同上，在其他架构（Pascal/Volta）上才有实质意义
+    //
+    //   两个属性的一般性原则（适用于真正使用大量 dynamic SMEM 的 kernel）：
+    //     只设 MaxDynamic=90 KiB，不设 carveout
+    //       → kernel 被允许申请 90 KiB，但在 Pascal/Volta 等默认 carveout 非 100% 的架构上
+    //         物理 SMEM 分区可能不足，导致 SM 上能并发的 block 数减少（occupancy 下降）
+    //         注意：carveout 是 preferred hint，驱动在 launch 时会按需调整，通常不会导致 block 无法调度
+    //     只设 carveout=100，不设 MaxDynamic
+    //       → SM 物理分配偏 SMEM，但 kernel 仍受 40 KiB 软件上限，<<<>>> 无法传入更大值
+    //         多余的物理 SMEM 被浪费，kernel 实际无法使用超过 40 KiB 的动态 SMEM
+    //     两者同时设置：
+    //       → kernel 被允许申请 90 KiB，SM 也倾向分配足够物理 SMEM，occupancy 最优
+    //
+    //   对 kernel_3 的实际情况：
+    //     kernel_3 只用 8 KiB 静态 SMEM，<<<>>> 第三个参数缺省 = 0，实际动态 SMEM 用量 = 0
+    //     MaxDynamic=90 KiB 设了但从未实际使用，两个属性在本机 sm_86 均无可观测效果
+    //     原始注释："This doesn't currently make a difference"——这才是最准确的描述
+    //     保留这两个调用是跨架构最佳实践，而非 kernel_3 本身的功能需要
+
+
+    // ── cudaFuncSetAttribute 的持久性 ──────────
+    //
+    //   cudaFuncSetAttribute 修改的是 CUDA context 内 per-kernel 的全局属性，
+    //   效果在同一进程内永久有效，不会因为函数返回而重置
+    //   因此 benchmark 循环从第二轮起，"before" 读取的已是上一轮设置过的值
+    //   → 想观察真正的"设置前默认值"，必须只在第一次调用时写文件（record 机制）
+
+    // ── 本 kernel 在 sm_86 上的实验结果总结 ───────────
+    //
+    //   真实默认值（进程启动后第一次读取）：
+    //     maxDynamicSharedSizeBytes = 40 KiB（= 48 - 8），preferredShmemCarveout = 100
+    //     注：sm_86 carveout 默认 100，不是 -1（其他架构默认 -1 = cudaSharedmemCarveoutDefault）
+    //
+    //   设置 MaxDynamic=90*1024 后：
+    //     maxDynamicSharedSizeBytes = 90 KiB ✓
+    //
+    //   设置 carveout=MaxShared 后（sm_86 上等于空操作）：
+    //     preferredShmemCarveout = 100（未变）
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // cudaCheck(cudaFuncSetAttribute(gemm_shared_mem_block<32>,
+    //                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+    //                     91*1024));
+
+    // L1 cache becomes useless, since we access GMEM only via SMEM, so we carve
+    // out all of L1 to SMEM. This doesn't currently make a difference, since
+    // occupancy is limited by reg and thread count, but it's good to do anyway.
+    // （sm_86 上 carveout 默认已是 100，此调用在本机等于空操作；
+    //  保留此调用是为了在 Pascal/Volta 等默认 carveout 非 100 的架构上也能正确运行）
+    cudaCheck(cudaFuncSetAttribute(gemm_shared_mem_block<32>,
+                         cudaFuncAttributePreferredSharedMemoryCarveout,
+                         cudaSharedmemCarveoutMaxShared));
+
+
+    cudaCheck(cudaGetDeviceProperties_v2(&deviceProp, deviceIdx));
+    cudaCheck(cudaFuncGetAttributes(&funcAttributes, reinterpret_cast<const void*>(gemm_shared_mem_block<32>)));
+
+    file << "after cudaFuncSetAttribute,\n";
+    file << "device properties are listed as below: \n";
+    file << "deviceProp.sharedMemPerMultiprocessor: ";
+    // / 优先级高于 <<，(1<<10)=1024，括号防止 1<<10 被解析为流插入运算符
+    file << deviceProp.sharedMemPerMultiprocessor / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "deviceProp.reservedSharedMemPerBlock: ";
+    file << deviceProp.reservedSharedMemPerBlock / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "deviceProp.sharedMemPerBlock: ";
+    file << deviceProp.sharedMemPerBlock / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "deviceProp.sharedMemPerBlockOptin: ";
+    file << deviceProp.sharedMemPerBlockOptin  / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "deviceProp.regsPerBlock: ";
+    file << deviceProp.regsPerBlock;
+    file << "\n";
+    file << "deviceProp.regsPerMultiprocessor: ";
+    file << deviceProp.regsPerMultiprocessor;
+    file << "\n\n";
+    file << "kernel_3 properties are listed as below: \n";
+    file << "funcAttributes.sharedSizeBytes: ";
+    file << funcAttributes.sharedSizeBytes / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "funcAttributes.maxDynamicSharedSizeBytes: ";
+    file << funcAttributes.maxDynamicSharedSizeBytes / (1<<10);
+    file << " KiB";
+    file << "\n";
+    file << "funcAttributes.preferredShmemCarveout: ";
+    file << funcAttributes.preferredShmemCarveout;
+    file << "\n";
+    file << "funcAttributes.localSizeBytes: ";
+    file << funcAttributes.localSizeBytes;
+    file << "\n";
+    file << "funcAttributes.numRegs: ";
+    file << funcAttributes.numRegs;
+    file << "\n\n";
+  }
+
+  gemm_shared_mem_block_v2<32>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+  cudaCheck(cudaGetLastError());
 }
 
-void runSgemm1DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
+void rungemm1DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
                            float beta, float *C) {
   const uint BM = 64;
   const uint BN = 64;
@@ -385,8 +816,10 @@ void runSgemm1DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
   const uint TM = 8;
   dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
   dim3 blockDim((BM * BN) / TM);
-  sgemm1DBlocktiling<BM, BN, BK, TM>
+  gemm1DBlocktiling<BM, BN, BK, TM>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+  cudaCheck(cudaGetLastError());
 }
 
 void runSgemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
@@ -401,6 +834,8 @@ void runSgemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
     dim3 blockDim((BM * BN) / (TM * TN));
     sgemm2DBlocktiling<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    cudaCheck(cudaGetLastError());
   } else {
     // this is a hacky solution to the underlying problem
     // of not having proper bounds checking in the kernel
@@ -410,6 +845,8 @@ void runSgemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
     dim3 blockDim((BM * BN) / (TM * TN));
     sgemm2DBlocktiling<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    cudaCheck(cudaGetLastError());
   }
 }
 
@@ -434,6 +871,8 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     dim3 blockDim((BM * BN) / (TM * TN));
     sgemmVectorize<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    cudaCheck(cudaGetLastError());
   }
 }
 
@@ -458,6 +897,8 @@ void runSgemmResolveBankConflicts(int M, int N, int K, float alpha, float *A,
     dim3 blockDim((BM * BN) / (TM * TN));
     sgemmResolveBankConflicts<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    cudaCheck(cudaGetLastError());
   }
 }
 
@@ -482,6 +923,8 @@ void runSgemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
     dim3 blockDim((BM * BN) / (TM * TN));
     sgemmResolveBankExtraCol<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    cudaCheck(cudaGetLastError());
   }
 }
 
@@ -525,6 +968,8 @@ void runSgemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
   dim3 gridDim(CEIL_DIV(N, K9_BN), CEIL_DIV(M, K9_BM));
   sgemmAutotuned<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+  cudaCheck(cudaGetLastError());
 }
 
 void runSgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
@@ -586,6 +1031,8 @@ void runSgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
   sgemmWarptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
                   K10_TN, K10_NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+  cudaCheck(cudaGetLastError());
 }
 
 void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
@@ -647,6 +1094,8 @@ void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
   sgemmDoubleBuffering<K11_BM, K11_BN, K11_BK, K11_WM, K11_WN, K11_WNITER,
                        K11_TM, K11_TN, K11_NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+  cudaCheck(cudaGetLastError());
 }
 
 void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
@@ -715,10 +1164,13 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
   runSgemmDoubleBuffering2<K12_BM, K12_BN, K12_BK, K12_WM, K12_WN, K12_WNITER,
                            K12_TM, K12_TN, K12_NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+  cudaCheck(cudaGetLastError());
 }
 
 void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
-                float *B, float beta, float *C, cublasHandle_t handle) {
+                float *B, float beta, float *C, cublasHandle_t handle, int deviceIdx, bool record) {
+  //参数默认值只需要在头文件的函数声明中写就可以了，因为默认参数是在编译阶段由调用点决定的
   switch (kernel_num) {
   case 0:
     runCublasFP32(handle, M, N, K, alpha, A, B, beta, C);
@@ -730,10 +1182,10 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     run_gemm_coalesce(M, N, K, alpha, A, B, beta, C);
     break;
   case 3:
-    run_sgemm_shared_mem_block(M, N, K, alpha, A, B, beta, C);
+    run_gemm_shared_mem_block(M, N, K, alpha, A, B, beta, C,deviceIdx,record);
     break;
   case 4:
-    runSgemm1DBlocktiling(M, N, K, alpha, A, B, beta, C);
+    rungemm1DBlocktiling(M, N, K, alpha, A, B, beta, C);
     break;
   case 5:
     runSgemm2DBlocktiling(M, N, K, alpha, A, B, beta, C);

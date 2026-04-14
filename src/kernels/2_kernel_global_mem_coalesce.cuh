@@ -96,11 +96,11 @@ __global__ void gemm_global_mem_coalesce(int M, int N, int K, float alpha,
   //   ┌───────────────────┬─────────────────────────────────────┬─────────────────────────────────────┐
   //   │                   │                naive                │              coalesced              │
   //   ├───────────────────┼─────────────────────────────────────┼─────────────────────────────────────┤
-  //   │ A[x/cRow * K + i] │ 32个线程行不同，stride=K → 32次事务 │ 32个线程行相同 → broadcast，1次事务 │
+  //   │ A[x/cRow * K + i] │ 32个线程行不同，stride=K → 32次事务 │ 32个线程行相同 → broadcast，1次事务         │
   //   ├───────────────────┼─────────────────────────────────────┼─────────────────────────────────────┤
-  //   │ B[i*N + y/cCol]   │ 32个线程列相同 → broadcast，1次事务 │ 32个线程列连续 → coalesced，1次事务 │
+  //   │ B[i*N + y/cCol]   │ 32个线程列相同 → broadcast，1次事务 │ 32个线程列连续 → coalesced，1次事务         │
   //   ├───────────────────┼─────────────────────────────────────┼─────────────────────────────────────┤
-  //   │ C写回             │ stride=N → 32次事务                 │ 列连续 → coalesced，1次事务         │
+  //   │ C写回             │ stride=N → 32次事务                 │ 列连续 → coalesced，1次事务              │
   //   └───────────────────┴─────────────────────────────────────┴─────────────────────────────────────┘
   const int cRow = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
   const int cCol = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
@@ -114,4 +114,23 @@ __global__ void gemm_global_mem_coalesce(int M, int N, int K, float alpha,
     }
     C[cRow * N + cCol] = alpha * tmp + beta * C[cRow * N + cCol];
   }
+
+
+  // 复写
+  // int blockInitCol {};
+  // int blockInitRow {};
+  //
+  // blockInitCol = blockIdx.x * BLOCKSIZE;
+  // blockInitRow = blockIdx.y * BLOCKSIZE;
+  //
+  // int col = blockInitCol + threadIdx.x % BLOCKSIZE;
+  // int row = blockInitRow + threadIdx.x / BLOCKSIZE;
+  // if (col < M && row < N) {
+  //   float temp {0.0f};
+  //   for (int i =0; i < K; ++i) {
+  //     temp += A[row * K + i] * B[i * N + col];
+  //   }
+  //   C[row * N + col] = alpha * tmp + beta * C[row * N + col];
+  // }
+
 }

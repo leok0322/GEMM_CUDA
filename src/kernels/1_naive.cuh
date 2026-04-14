@@ -26,6 +26,11 @@ MxK * KxN = MxN
       M、N 决定输出矩阵 C 的形状，K 决定每个元素需要累加多少次
 */
 
+// 【__global__ 函数定义在头文件中不需要 inline】
+// 普通函数定义在头文件中会被多个翻译单元包含，主机链接时报 multiple definition，需要 inline
+// __global__ / __device__ 函数是设备端代码，不参与主机链接（ld），天然内部链接：
+//   每个翻译单元编译出自己的一份设备代码，由 nvlink 在设备链接阶段统一处理
+//   nvlink 按调用关系解析，不受 C++ ODR 规则约束，无需 inline
 __global__ void gemm_naive(int M, int N, int K, float alpha, const float *A,
                             const float *B, float beta, float *C) {
   // 将 block 坐标 + block 内线程坐标 映射为 C 矩阵的全局行列坐标

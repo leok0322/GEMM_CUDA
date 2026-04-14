@@ -19,8 +19,9 @@
 #include <iomanip>
 #include <runner.cuh>
 #include <vector>
+#include <error_check.cuh>
 
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))  // 需要在cudaCheck定义之后才能定义宏
 
 
 const std::string errLogFile = "matrixValidationFailure.txt";
@@ -149,15 +150,15 @@ int main(int argc, char **argv) {
     // kernel function timing to avoid cold start errors
     if (kernel_num != 0) {
       try {
+        bool record {false};
+        if (kernel_num == 3 && m == SIZE[0]) {
+          record = true;
+        }
         run_kernel(0, m, n, k, alpha, dA, dB, beta, dC_ref,
-                   handle); // cuBLAS
-        // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
-        cudaCheck(cudaGetLastError());
+           handle,deviceIdx); // cuBLAS
         run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC,
-                   handle); // Executes the kernel, modifies the result matrix
-        // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
-        cudaCheck(cudaGetLastError());
-        // 再等待 GPU 执行完毕，捕获 kernel 运行时的异步错误
+                   handle,deviceIdx,record); // Executes the kernel, modifies the result matrix
+        // 等待 GPU 执行完毕，捕获 kernel 运行时的异步错误
         // 若顺序反过来，cudaDeviceSynchronize 会消费掉异步错误，cudaGetLastError 可能漏报
         cudaCheck(cudaDeviceSynchronize());
       } catch (const std::exception &e) {
@@ -217,9 +218,7 @@ int main(int argc, char **argv) {
     for (int j = 0; j < repeat_times; j++) {
       try {
         // We don't reset dC between runs to save time
-        run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC, handle);
-        // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
-        cudaCheck(cudaGetLastError());
+        run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC, handle,deviceIdx);
       } catch (const std::exception &e) {
         // 注意：此 catch 只能捕获 run_kernel 内 throw 的 C++ 异常（如非法 kernel 编号）
         // CUDA 错误由 cudaCheck 内部调用 exit() 处理，不经过异常机制，catch 捕获不到
@@ -229,7 +228,7 @@ int main(int argc, char **argv) {
     }
 
     cudaEventRecord(end);
-    cudaEventSynchronize(end);
+    cudaCheck(cudaEventSynchronize(end));
     cudaEventElapsedTime(&elapsed_time, beg, end);
     // cudaEventElapsedTime 返回毫秒，除以 1000 转换为秒
     // 1000. 是 double 字面量，elapsed_time(float) 会隐式提升为 double 再除，结果截断回 float
@@ -305,7 +304,7 @@ int main(int argc, char **argv) {
     // std::filesystem::create_directories：递归创建目录，已存在则不报错（幂等）
     // 需要 C++17，CMakeLists.txt 中 set(CMAKE_CXX_STANDARD 17) 已满足
     std::filesystem::create_directories(resultDir);
-    const std::string resultLogFile = resultDir + "/kernel" + argv[1] + "_result.txt";
+    const std::string resultLogFile = resultDir + "/kernel_" + argv[1] + "_result.txt";
     std::ofstream fs;
     // 第一个 size（SIZE 首元素）时覆盖旧文件，后续 size 追加写入同一文件
     // std::ios::app（append）：每次写入都定位到文件末尾，不覆盖已有内容

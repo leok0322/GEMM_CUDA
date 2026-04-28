@@ -635,6 +635,75 @@ void run_gemm_shared_mem_block(int M, int N, int K, float alpha, float *A,
     //     2. 在此前提下，按 carveout 偏好分配剩余空间给 L1
     //     3. carveout 是 preferred，驱动可因其他约束（如同 SM 上其他 kernel）而偏离
     //
+    //   【两个维度独立：per-block 软件上限 vs SM 级物理分区】
+    //
+    //   第三参数（per-block，软件层）：每个 block 实际申请多少 dynamic SMEM
+    //     默认上限 = deviceProp.sharedMemPerBlock - sharedSizeBytes = 48 - 8 = 40 KiB
+    //     不设置第三参数（或传 0）：实际 dynamic = 0，每 block 只占 static 8 KiB
+    //     设置 MaxDynamicSharedMemorySize 可将上限提升至 ~100 KiB
+    //
+    //   carveout（SM 级，物理层）：SM 上 SMEM/L1 分区边界定在哪里
+    //     与每个 block 实际用多少无关，是整个 SM 的物理设置
+    //     L1 是 SM 级资源，SM 上所有并发 block 和 warp 共享同一个 L1
+    //
+    //   SMEM 分区大小 = max(实际需求, carveout 偏好值)
+    //     carveout=MaxShared：偏好值 = 100 KiB → 分区始终顶到 100 KiB
+    //     carveout=MaxL1    ：偏好值 = 实际需求 → 分区压到最小
+    //
+    //   【关键：SMEM 分区内闲置的空间不会变成 L1】
+    //
+    //   例A（kernel_3，static=8 KiB，第三参数=0，2 block 并发）：
+    //
+    //     carveout=MaxShared：
+    //       每 block SMEM = 8+0 = 8 KiB，实际需求 = 8×2 = 16 KiB
+    //       SMEM 分区 = max(16, 100) = 100 KiB（84 KiB 闲置但不能给 L1）
+    //       L1（SM 级）= 128 - 100 = 28 KiB
+    //
+    //     carveout=MaxL1：
+    //       每 block SMEM = 8+0 = 8 KiB，实际需求 = 8×2 = 16 KiB
+    //       SMEM 分区 = min(16, 100) = 16 KiB
+    //       L1（SM 级）= 128 - 16 = 112 KiB
+    //
+    //   即使第三参数=0（每 block dynamic=0），carveout=MaxShared 下
+    //   L1 依然只有 28 KiB——因为分区边界由 carveout 决定，不由实际用量决定
+    //
+    //   例B（static=8 KiB，第三参数=40 KiB，2 block 并发）：
+    //
+    //     carveout=MaxShared：
+    //       每 block SMEM = 8+40 = 48 KiB，实际需求 = 48×2 = 96 KiB
+    //       SMEM 分区 = max(96, 100) = 100 KiB（4 KiB 闲置）
+    //       L1（SM 级）= 128 - 100 = 28 KiB
+    //
+    //     carveout=MaxL1：
+    //       每 block SMEM = 8+40 = 48 KiB，实际需求 = 48×2 = 96 KiB
+    //       SMEM 分区 = min(96, 100) = 96 KiB
+    //       L1（SM 级）= 128 - 96 = 32 KiB
+    //
+    //   第三参数=40 KiB 时，两种 carveout 下 L1 差距缩小（28 vs 32 KiB）
+    //   因为实际需求 96 KiB 已接近 100 KiB 上限，MaxL1 的压缩空间所剩无几
+    //
+    //   例C：【同时设置 MaxL1 carveout 和大 MaxDynamicSharedMemorySize 时驱动被迫偏离的例子】
+    //
+    //   代码：
+    //     cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+    //                          cudaSharedmemCarveoutMaxL1);        // 偏好：L1 最大
+    //     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    //                          48 * 1024);                         // 允许 48 KiB dynamic
+    //     kernel<<<grid, block, 40 * 1024>>>(...)                  // 实际传入 40 KiB
+    //
+    //   sm_86 上的计算（total SRAM = 128 KiB，static SMEM = 8 KiB）：
+    //     每 block SMEM = static 8 KiB + dynamic 40 KiB = 48 KiB
+    //     并发 block 数 = floor(100 KiB / 48 KiB) = 2 block       ← SMEM 约束推导
+    //     实际需求      = 48 KiB × 2 block = 96 KiB
+    //     SMEM 分区     = 96 KiB（MaxL1 将分区压到最小，最小即实际需求 96 KiB）
+    //                   = min(实际需求 96, 硬件上限 100) = 96 KiB
+    //     L1（SM 级）   = 128 - 96 = 32 KiB                       ← 被迫结果
+    //
+    //   carveout=MaxL1 偏好 L1≈112 KiB（实际需求仅 16 KiB 时可实现，见例A）
+    //   但此处实际需求已达 96 KiB，SMEM 分区无法低于 96 KiB
+    //   → L1 实际只有 32 KiB，而非 MaxL1 期望的 112 KiB
+    //   → carveout 是 hint（偏好），驱动优先满足 SMEM 硬性需求，偏好只在剩余空间内生效
+
     //   物理分区示意（sm_86 总 SRAM = 128 KiB）：
     //     carveout = MaxShared (100%)：SMEM ≈ 100 KiB，L1 ≈  28 KiB（最小）
     //     carveout = MaxL1    (  0%)：SMEM = 满足 kernel 实际需求（最小，如 8 KiB），
@@ -814,6 +883,16 @@ void rungemm1DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
   const uint BN = 64;
   const uint BK = 8;
   const uint TM = 8;
+  // gridDim(CEIL_DIV(N,BN), CEIL_DIV(M,BM))：
+  //   kernel_4 中 cCol=blockIdx.x，cRow=blockIdx.y（x→列，y→行）
+  //   → gridDim.x = CEIL_DIV(N,BN) = 4096/64 = 64：列方向共 64 个 block
+  //   → gridDim.y = CEIL_DIV(M,BM) = 4096/64 = 64：行方向共 64 个 block
+  //   → 总 block 数 64×64 = 4096，覆盖 C 的全部 BM×BN tile
+  //
+  // blockDim((BM*BN)/TM)：
+  //   C tile 共 BM×BN = 64×64 = 4096 个元素，每个线程计算 TM=8 个
+  //   → 需要 4096/8 = 512 个线程/block
+  //   同时满足加载约束：BM*BK = BN*BK = 64*8 = 512（assert 验证）
   dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
   dim3 blockDim((BM * BN) / TM);
   gemm1DBlocktiling<BM, BN, BK, TM>

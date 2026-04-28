@@ -1,0 +1,209 @@
+# GEMM Kernel HBM（Global Memory）访问量分析
+# 矩阵规模：A(M×K)，B(K×N)，C(M×N)
+# 假设：不考虑 L2 cache 命中，分析理论 HBM 访问下界
+# 单位：float（× 4 bytes 得字节数）
+#
+# YAML 语法说明：
+#   >  折叠块标量（folded block scalar）：多行文本折叠为一行，换行符替换为空格
+#   |  字面块标量（literal block scalar）：保留换行符，原样输出
+#   两者都用于长字符串的排版换行，不影响语义
+
+common:
+  # ── 计算量 ────────────────────────────────────────────────────────
+  # FLOP（Floating Point Operation）= 浮点操作总次数，是数量，无时间单位
+  # FLOPS = FLOP / 时间，是速率（硬件峰值性能，如 A100 = 19.5 TFLOPS）
+  flops: "2 × M × N × K"             # 乘法 MNK 次 + 加法 MNK 次（A@B 主项，忽略 C 的 3MN 次操作）
+
+  # ── 总 HBM 字节数 ─────────────────────────────────────────────────
+  # 完整公式：总 HBM 字节数 = (A读 + B读 + C读 + C写) × 4
+  # C 读写（2MN）严格上应纳入分母，对应的 C FLOPs（3MN）也应纳入分子
+  # 但 K >> 1 时两者均为 O(MN)，相对 O(MNK) 可同时忽略，结果不变
+  # 工程惯例：分子只写 2MNK，分母视 K 大小决定是否保留 C 项
+  #
+  #   kernel        A读         B读          C读写      总字节（×4）
+  #   kernel_1      MNK         MNK          2MN        (2MNK + 2MN) × 4
+  #   kernel_2      MNK         MNK          2MN        (2MNK + 2MN) × 4   # 总量同 kernel_1，带宽利用率不同
+  #   kernel_3      MNK/BS      MNK/BS       2MN        (2MNK/BS + 2MN) × 4
+  minimum_hbm_read: "MK + KN + MN"   # 最优下界：A/B/C 各读一次
+  minimum_hbm_write: "MN"            # C 写一次
+
+  # ── 算术强度 ──────────────────────────────────────────────────────
+  # 算术强度（FLOP/byte）= 总计算量（FLOP）/ 总 HBM 访问量（byte），无时间，纯数量比
+  # 用于与硬件 ridge point 比较，判断瓶颈类型：
+  #   ridge point = 峰值算力（FLOPS）/ 峰值带宽（byte/s）= FLOP/byte
+  #   算术强度 < ridge point → 带宽瓶颈，实际 FLOPS = 算术强度 × 实际带宽
+  #   算术强度 > ridge point → 计算瓶颈，实际 FLOPS = 硬件峰值算力
+  #
+  #   kernel        算术强度（K>>BS时近似）
+  #   kernel_1      2MNK / (2MNK×4)      = 0.25 FLOP/byte
+  #   kernel_2      2MNK / (2MNK×4)      = 0.25 FLOP/byte
+  #   kernel_3      2MNK / (2MNK/BS×4)   = BS/4 = 8 FLOP/byte（BS=32）
+  #
+  # A100：ridge point = 19.5 TFLOPS / 2 TB/s = 9.75 FLOP/byte
+  #   kernel_1/2：0.25 << 9.75 → 严重带宽瓶颈
+  #   kernel_3：  8.0  <  9.75 → 仍带宽瓶颈，但已接近 ridge point
+  arithmetic_intensity_formula: "FLOP / (总 HBM 字节数)"   # FLOP 是总计算量（次数），非速率 FLOPS
+
+# ──────────────────────────────────────────────────────────────────
+kernels:
+
+  kernel_1_naive:
+    description: "每个线程独立从 HBM 读完整行/列，无任何复用"
+    blockDim: "(32, 32)"
+    gridDim: "(CEIL_DIV(M,32), CEIL_DIV(N,32))"
+
+    hbm_reads:
+      A:
+        formula: "M × N × K"
+        reason: >
+          A[i][k] 被 C 第 i 行的所有 N 个线程各自独立读取，
+          共 MK 个元素，每个元素被读 N 次
+      B:
+        formula: "M × N × K"
+        reason: >
+          B[k][j] 被 C 第 j 列的所有 M 个线程各自独立读取，
+          共 KN 个元素，每个元素被读 M 次
+      C:
+        formula: "M × N"
+        reason: "beta × C[i][j]，每个线程读一次"
+
+    hbm_writes:
+      C:
+        formula: "M × N"
+
+    total_hbm: "2MNK + 2MN ≈ 2MNK（K 很大时）"
+    arithmetic_intensity: "2MNK / (2MNK × 4) = 0.25 FLOP/byte"
+
+    notes:
+      - "cache line 利用率低：非 coalesced 访问导致每次 128-byte 事务只用 4 byte"
+      - "实际 HBM 事务量可达理论值的 32 倍（warp 内 32 线程访问不连续地址）"
+
+  # ──────────────────────────────────────────────────────────────────
+  kernel_2_coalesce:
+    description: "修正访问模式使 warp 内 32 线程访问连续地址，提升 cache line 利用率"
+    blockDim: "(32×32 = 1024)"
+    gridDim: "(CEIL_DIV(M,32), CEIL_DIV(N,32))"
+
+    hbm_reads:
+      A:
+        formula: "M × N × K"
+        reason: "与 kernel_1 相同，每个元素仍被读 N 次，总量不变"
+      B:
+        formula: "M × N × K"
+        reason: "与 kernel_1 相同"
+      C:
+        formula: "M × N"
+
+    hbm_writes:
+      C:
+        formula: "M × N"
+
+    total_hbm: "2MNK + 2MN（理论总量与 kernel_1 相同）"
+    arithmetic_intensity: "0.25 FLOP/byte（理论值与 kernel_1 相同）"
+
+    improvement_over_kernel_1:
+      what_changed: "cache line 利用率"
+      kernel_1: "每条 128-byte cache line 只利用 4 bytes（利用率 3.1%）"
+      kernel_2: "每条 128-byte cache line 利用 128 bytes（利用率 100%）"
+      effect: >
+        实际有效 HBM 带宽利用提升 32 倍，
+        但理论 HBM 访问字节数不变——改善的是带宽效率，不是访问总量
+
+    notes:
+      - "HBM 访问总量与 kernel_1 相同，但每次事务不再浪费"
+      - "性能提升来自带宽利用率，而非减少访问次数"
+
+  # ──────────────────────────────────────────────────────────────────
+  kernel_3_shared_mem_blocking:
+    description: "block 内协作加载 tile 到 shared memory，每个 HBM 元素只读一次后复用 BLOCKSIZE 次"
+    blockDim: "(32×32 = 1024)"
+    gridDim: "(CEIL_DIV(M,32), CEIL_DIV(N,32))"
+    BLOCKSIZE: 32
+
+    tile_reuse:
+      A_tile:
+        size: "BLOCKSIZE × BLOCKSIZE = 32×32"
+        loaded_by: "block 内 1024 线程协作，每元素加载一次"
+        reused: "BLOCKSIZE=32 次（block 内 32 列方向线程共用同一行）"
+      B_tile:
+        size: "BLOCKSIZE × BLOCKSIZE = 32×32"
+        loaded_by: "block 内 1024 线程协作，每元素加载一次"
+        reused: "BLOCKSIZE=32 次（block 内 32 行方向线程共用同一列）"
+
+    hbm_reads:
+      A:
+        formula: "M × K × (N / BLOCKSIZE) = MNK / BLOCKSIZE"
+        derivation_angle_1_per_element: >
+          A 矩阵共 M×K 个元素，分析每个元素被读几次：
+          A[i][k] 属于行 tile cRow = i/BS，
+          所有 cCol=0..N/BS-1 的 block（共 N/BS 个）都有相同的 cRow，
+          各自独立从 HBM 加载同一 tile，互不共享。
+          → 每个 A 元素被读 N/BS 次。
+          总 A HBM 读 = M×K（元素数）× N/BS（每元素读次数）= MNK/BS
+        derivation_angle_2_per_block: >
+          grid 共 (M/BS)×(N/BS) 个 block，
+          每个 block 沿 K 方向加载 K/BS 个 A tile，每 tile 大小 BS×BS。
+          每 block A 读取量 = K/BS × BS² = K×BS。
+          总 A HBM 读 = (M/BS)×(N/BS) × K×BS = MNK/BS
+        l2_cache_note: >
+          MNK/BS 是 L2 cache 完全失效时的悲观估计（每 block 都触发 HBM 读）。
+          同一 cRow 的 N/BS 个 block 加载相同 A tile，若 L2 cache 足够大可自动命中，
+          实际 HBM 读接近 M×K（每元素读 1 次，最优）。
+          真实值介于 MK（最优）和 MNK/BS（最差）之间，取决于 L2 大小和矩阵规模。
+      B:
+        formula: "K × N × (M / BLOCKSIZE) = MNK / BLOCKSIZE"
+        derivation: >
+          与 A 对称：B[k][j] 属于列 tile cCol = j/BS，
+          所有 cRow=0..M/BS-1 的 block（共 M/BS 个）各自独立加载同一 B tile。
+          → 每个 B 元素被读 M/BS 次。
+          总 B HBM 读 = K×N × M/BS = MNK/BS
+      C:
+        formula: "M × N"
+
+    hbm_writes:
+      C:
+        formula: "M × N"
+
+    total_hbm: "2MNK/BLOCKSIZE + 2MN ≈ 2MNK/32（K 很大时）"
+    arithmetic_intensity: "2MNK / (2MNK/32 × 4) = 32/4 = 8 FLOP/byte"
+
+    improvement_over_kernel_1:
+      hbm_reduction: "BLOCKSIZE = 32 倍"
+      arithmetic_intensity_ratio: "8 / 0.25 = 32 倍"
+      mechanism: "shared memory 作为 on-chip 缓冲，将 BLOCKSIZE 次 HBM 读合并为 1 次"
+
+    notes:
+      - "BLOCKSIZE 越大，HBM 访问量越少，但 shared memory 占用越多"
+      - "BLOCKSIZE=32 时 shared memory 用量 = 2×32×32×4 = 8 KiB/block"
+      - "理论算术强度 8 FLOP/byte，A100 HBM 带宽 2 TB/s → 理论峰值 16 TFLOPS"
+
+# ──────────────────────────────────────────────────────────────────
+summary:
+  table:
+    - kernel:               "kernel_1 naive"
+      A_reads:              "MNK"
+      B_reads:              "MNK"
+      total_hbm:            "2MNK"
+      arithmetic_intensity: "0.25 FLOP/byte"
+      key_bottleneck:       "HBM 带宽 + cache line 浪费"
+
+    - kernel:               "kernel_2 coalesce"
+      A_reads:              "MNK"
+      B_reads:              "MNK"
+      total_hbm:            "2MNK"
+      arithmetic_intensity: "0.25 FLOP/byte"
+      key_bottleneck:       "HBM 带宽（cache line 已充分利用）"
+
+    - kernel:               "kernel_3 shared_mem_blocking"
+      A_reads:              "MNK / BLOCKSIZE"
+      B_reads:              "MNK / BLOCKSIZE"
+      total_hbm:            "2MNK / BLOCKSIZE"
+      arithmetic_intensity: "8 FLOP/byte（BLOCKSIZE=32）"
+      key_bottleneck:       "shared memory 带宽 / 计算单元"
+
+  roofline_note: >
+    A100 规格：HBM 带宽 2 TB/s，FP32 峰值 19.5 TFLOPS
+    Ridge point（计算/带宽瓶颈分界）= 19500 / 2000 = 9.75 FLOP/byte
+    kernel_1/2：0.25 < 9.75 → 严重带宽瓶颈
+    kernel_3：  8.0  < 9.75 → 仍是带宽瓶颈，但已接近 ridge point
+    cuBLAS：   通过更大 tile + 向量化等手段使算术强度 > 9.75 → 计算瓶颈

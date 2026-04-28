@@ -138,8 +138,9 @@ add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-linein
 #   - 寄存器数（registers）：影响 GPU 占用率（occupancy）
 #   - 共享内存用量（shared memory bytes）
 #   - 局部内存用量（local memory bytes，溢出寄存器时产生，性能很差）
-# 默认注释掉，需要分析 kernel 资源瓶颈时手动开启
- add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:--ptxas-options=-v>")
+# Debug 和 Release 均开启，方便在 Release 下也能看到真实优化后的资源用量
+add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:--ptxas-options=-v>")
+add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--ptxas-options=-v>")
 
 # aux_source_directory(<目录> <变量>)：扫描指定目录下的所有源文件，将路径列表存入变量
 #   - ${PROJECT_SOURCE_DIR} : CMake 内置变量，指向 project() 所在的根目录（即本文件所在目录）
@@ -237,3 +238,46 @@ target_link_libraries(cuBLAS_gemm CUDA::cudart CUDA::cublas)
 add_executable(simplest_kernel simplest_kernel.cu)
 target_include_directories(simplest_kernel PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(simplest_kernel CUDA::cudart)
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 【CLion / CMake 四个操作的含义与对应命令行】
+#
+# ── Reload CMake Project ─────────────────────────────────────────────────
+#   含义：重新执行 CMakeLists.txt，更新构建规则文件（build.ninja / Makefile）
+#         不编译任何源文件，不删除已有 .o 文件
+#   触发时机：修改 CMakeLists.txt 后必须执行，否则新的编译选项不会写入构建规则
+#   命令行：
+#     cmake -DCMAKE_BUILD_TYPE=Release \
+#           -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
+#           -G Ninja \
+#           -S /home/liam/cpp_linux/GEMM_CUDA \
+#           -B /home/liam/cpp_linux/GEMM_CUDA/cmake-build-release
+#
+# ── Clean ────────────────────────────────────────────────────────────────
+#   含义：删除所有编译产物（.o 文件、可执行文件），保留 CMake 配置（build.ninja）
+#         下次 Build 时所有源文件强制重新编译
+#   命令行：
+#     cmake --build cmake-build-release --target clean
+#
+# ── Build（增量编译）────────────────────────────────────────────────────
+#   含义：只重新编译有变化的源文件（.cu/.cpp 内容变了），其余复用已有 .o
+#         Ninja 通过文件时间戳 / 内容哈希判断哪些文件需要重编译
+#   注意：CMakeLists.txt 变了但未 Reload，Build 不会感知编译选项的变化
+#   命令行：
+#     cmake --build cmake-build-release --target gemm -- -j 18
+#
+# ── Rebuild ──────────────────────────────────────────────────────────────
+#   含义：等价于 Clean + Build，先删除所有产物，再完整重新编译
+#         用于解决增量编译状态不一致、头文件依赖混乱等问题
+#   命令行：
+#     cmake --build cmake-build-release --target clean
+#     cmake --build cmake-build-release --target gemm -- -j 18
+#
+# ── 常见工作流 ──────────────────────────────────────────────────────────
+#   修改 CMakeLists.txt  → Reload → Build
+#   修改 .cu/.cuh 文件   → 直接 Build（增量编译）
+#   编译状态混乱/异常    → Rebuild
+#   彻底清除重来         → 删除 cmake-build-release 目录 → Reload → Build
+# ════════════════════════════════════════════════════════════════════════════

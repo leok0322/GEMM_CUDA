@@ -233,28 +233,64 @@ __global__ void gemm_shared_mem_block_v2(int M, int N, int K, float alpha,
   __shared__ float Bshared[BLOCKSIZE * BLOCKSIZE];
 
   float temp {0.0f};
-  if (totalRow < M && totalCol < N) {
-    for (int tileIdx = 0; tileIdx < K; tileIdx += BLOCKSIZE) {
+  for (int tileIdx = 0; tileIdx < K; tileIdx += BLOCKSIZE) {
 
-      // A：行坐标 totalRow（M方向），列坐标 tileIdx+col（K方向滑动）
-      // coalesced：warp 内 col=0..31 连续 → A 同一行连续 32 元素
-      Ashared[row * BLOCKSIZE + col] = A[totalRow * K + (tileIdx + col)];
+    // ── 边界安全性：tileIdx+col（A 列）和 tileIdx+row（B 行）是否越界 ──────
+    //
+    // 【情况1：K 是 BLOCKSIZE 整数倍 → 不越界】
+    //   例：K=32, BLOCKSIZE=8
+    //   循环：tileIdx = 0, 8, 16, 24，最后一次 tileIdx = K-BLOCKSIZE = 24
+    //   col/row 最大值 = BLOCKSIZE-1 = 7
+    //   A 列最大：24 + 7 = 31 = K-1  ✓（恰好触碰边界，未超出）
+    //   B 行最大：24 + 7 = 31 = K-1  ✓
+    //   公式：(K - BLOCKSIZE) + (BLOCKSIZE - 1) = K - 1
+    //   → tileIdx < K 这一个条件已足够，掩码始终为 true，无额外开销
+    //
+    // 【情况2：K 不是 BLOCKSIZE 整数倍 → 最后一个 tile 越界】
+    //   例：K=10, BLOCKSIZE=8
+    //   循环：tileIdx = 0, 8（因为 8 < 10，会运行 tileIdx=8 这一轮）
+    //   最后一次 tileIdx=8，col/row 仍跑完 0..7
+    //   A 列访问：8 + 0..7 = 8..15，但 A 列只有 0..9 → col≥2 时越界 ✗
+    //   B 行访问：8 + 0..7 = 8..15，但 B 行只有 0..9 → row≥2 时越界 ✗
+    //   → 必须用掩码：越界位置填 0.0f，不影响点积结果（0×anything=0）
 
-      // B：行坐标 tileIdx+row（K方向滑动），列坐标 totalCol（N方向）
-      // coalesced：warp 内 col=0..31 连续 → totalCol 连续 → B 同一行连续 32 元素
-      Bshared[row * BLOCKSIZE + col] = B[(tileIdx + row) * N + totalCol];
+    // A：行坐标 totalRow（M方向），列坐标 tileIdx+col（K方向滑动）
+    // coalesced：warp 内 col=0..31 连续 → A 同一行连续 32 元素
+    Ashared[row * BLOCKSIZE + col] = (tileIdx + col < K && totalRow < M)? A[totalRow * K + (tileIdx + col)] : 0.0f;
 
-      __syncthreads();
+    // B：行坐标 tileIdx+row（K方向滑动），列坐标 totalCol（N方向）
+    //
+    // warp 内（coalesced）：
+    //   同一 warp 内 row 相同，col=0..31 连续 → totalCol 连续
+    //   → B 同一行连续 32 个元素（128字节）→ 完全 coalesced ✓
+    //
+    // warp 间（不连续）：
+    //   row = threadIdx.x / BLOCKSIZE，相邻 warp 的 row 差 1
+    //   → warp k 访问 B[(tileIdx+k)*N + totalCol]
+    //   → warp k+1 访问 B[(tileIdx+k+1)*N + totalCol]
+    //   → 地址差 = N 个元素 = N×4 字节（例：N=4096 → 16KB）
+    //   → 相邻 warp 访问 B 的不同行，行间距 = N，不是 BLOCKSIZE×N
+    //
+    //   数值举例（BLOCKSIZE=32, N=4096, tileIdx=0, blockInitCol=0）：
+    //     warp 0：B[0*4096 + 0..31]  = B[0..31]
+    //     warp 1：B[1*4096 + 0..31]  = B[4096..4127]   ← 间隔 4096 个元素
+    //     warp 2：B[2*4096 + 0..31]  = B[8192..8223]   ← 间隔 4096 个元素
+    //   → 每个 warp 内部 coalesced，warp 间跨越 16KB → L2 sector 各自独立
+    Bshared[row * BLOCKSIZE + col] = (tileIdx + row < K && totalCol < N)? B[(tileIdx + row) * N + totalCol] : 0.0f;
 
-      // 点积：As 广播（无 bank conflict），Bs 连续访问（无 bank conflict）
-      for (int i = 0; i < BLOCKSIZE; ++i) {
-        temp += Ashared[row * BLOCKSIZE + i] * Bshared[i * BLOCKSIZE + col];
-      }
+    __syncthreads();
 
-      __syncthreads();
+    // 点积：As 广播（无 bank conflict），Bs 连续访问（无 bank conflict）
+    for (int i = 0; i < BLOCKSIZE; ++i) {
+      temp += Ashared[row * BLOCKSIZE + i] * Bshared[i * BLOCKSIZE + col];
     }
+
+    __syncthreads();
   }
 
-  // 写回（coalesced）：warp 内 col 连续 → C 同一行连续 32 元素
-  C[totalRow * N + totalCol] = alpha * temp + beta * C[totalRow * N + totalCol];
+  if (totalRow < M && totalCol < N) {
+    // 写回（coalesced）：warp 内 col 连续 → C 同一行连续 32 元素
+    C[totalRow * N + totalCol] = alpha * temp + beta * C[totalRow * N + totalCol];
+  }
+
 }

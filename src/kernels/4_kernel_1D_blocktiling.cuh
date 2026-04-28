@@ -9,387 +9,251 @@
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
-// 【kernel_4：1D Blocktiling】
+// ══════════════════════════════════════════════════════════════════════════════
+// kernel_4：1D Blocktiling
 //
 // 核心改进（对比 kernel_3）：
-//   kernel_3：每个线程计算 C 的 1 个元素，1024 线程/block
-//   kernel_4：每个线程计算 C 的 TM 个元素（M 方向连续），512 线程/block
-
-// 关键优化：tmpB 寄存器缓存，减少 shared memory 读取
+//   每线程从计算 1 个 C 元素 → 计算 TM 个（M 方向连续），引入 tmpB 寄存器缓存
 //
-//   kernel_3 的内层循环（每个线程算 1 个 C 元素）：
+// ── 关键优化：tmpB 寄存器缓存 Bs ──────────────────────────────────────────
+//
+//   kernel_3（每线程 1 个 C 元素）：
 //     for dotIdx in BK:
-//       tmp += As[row][dotIdx] * Bs[dotIdx][col]   // As/Bs 各读 1 次，无复用
+//       tmp += As[row][dotIdx] * Bs[dotIdx][col]   // Bs 每次从 smem 读，无复用
 //
-//   kernel_4 的内层循环（每个线程算 TM 个 C 元素，M 方向）：
+//   kernel_4（每线程 TM 个 C 元素，M 方向）：
 //     for dotIdx in BK:
 //       tmpB = Bs[dotIdx][threadCol]               // 读 1 次，缓存到寄存器
-//       for resIdx in TM:
-//         threadResults[resIdx] += As[(threadRow*TM+resIdx)][dotIdx] * tmpB
-//         // As：resIdx 每次不同行 → 必须读 TM 次（无法缓存）
-//         // tmpB：dotIdx/threadCol 固定 → 寄存器复用 TM 次，省 TM-1 次 smem 读
+//       for resIdx in TM:                          //   threadCol 固定 → 地址不变
+//         threadResults[resIdx] += As[threadRow*TM+resIdx][dotIdx] * tmpB
+//         // As 随 resIdx 变化 → 必须读 TM 次（无法缓存）
+//         // tmpB 地址不变 → 寄存器复用 TM 次，省 TM-1 次 smem 读
+//   每 dotIdx 节省 TM-1 次 Bs smem 读；BK 次迭代共节省 (TM-1)×BK 次/tile
 //
-//   每个 dotIdx 迭代：Bs 读 1 次（缓存）vs TM 次（无缓存）→ 节省 (TM-1)×BK 次 Bs 读
-//
-// 对称性（也可以缓存 As）：
-//   若每个线程改为负责 1 行 × TM 列（N 方向 tiling），则可缓存 tmpA：
+//   对称版本（N 方向 tiling）：每线程固定 1 行 × TM 列，改为缓存 tmpA：
 //     for dotIdx in BK:
-//       tmpA = As[threadRow][dotIdx]               // 读 1 次，缓存到寄存器
+//       tmpA = As[threadRow][dotIdx]               // 固定，缓存到寄存器
 //       for colIdx in TM:
 //         threadResults[colIdx] += tmpA * Bs[dotIdx][threadCol*TM+colIdx]
-//         // tmpA 复用 TM 次，省 TM-1 次 As 读
-//   kernel_4 选择 M 方向（缓存 Bs），对称版本是 N 方向（缓存 As），效果相同
-//   kernel_5（2D blocktiling）同时做两个方向，缓存 tmpA 和 tmpB，复用翻倍
-
-// 模板参数（实际值来自 runner.cu）：
-//   BM = 64：block 在 M 方向覆盖的行数
-//   BN = 64：block 在 N 方向覆盖的列数
-//   BK =  8：block 在 K 方向每次处理的列/行数（tile 深度）
-//   TM =  8：每个线程在 M 方向计算的元素数（thread-level tiling）
+//   kernel_5（2D blocktiling）同时缓存 tmpA 和 tmpB，双向复用
 //
-// 线程数：blockDim.x = BM * BN / TM = 64 * 64 / 8 = 512
-//   同时满足：BM * BK = 64 * 8 = 512（加载 As 所需线程数）
-//             BN * BK = 64 * 8 = 512（加载 Bs 所需线程数）
-//   assert 保证三者相等，确保每个线程恰好负责加载 As/Bs 各一个元素
+// ── 模板参数与线程数 ────────────────────────────────────────────────────────
 //
-// shared memory：
-//   As: BM × BK = 64 × 8 = 512 floats = 2 KiB
-//   Bs: BK × BN = 8 × 64 = 512 floats = 2 KiB
-//   合计 4 KiB（kernel_3 为 8 KiB，更小是因为 BK=8 而非 32）
+//   BM = 64, BN = 64, BK = 8, TM = 8
 //
-// 每个线程的寄存器：
-//   threadResults[TM=8]：存储 TM 个 C 元素的累加器（寄存器数组）
-//   512 线程 × 8 寄存器 = 4096 个累加器寄存器/block
+//   blockDim.x = BM*BN/TM = 64*64/8 = 512，同时满足：
+//     BM*BK = 64*8 = 512（加载 As 所需线程数）
+//     BN*BK = 64*8 = 512（加载 Bs 所需线程数）
+//   三者相等 → 每个线程恰好负责加载 As/Bs 各 1 个元素（assert 验证）
 //
-// grid/block 划分：
-//   gridDim = (CEIL_DIV(N,BN), CEIL_DIV(M,BM))  ← 注意 x/y 与 kernel_3 相反
-//   blockDim = (BM*BN/TM, 1, 1) = (512, 1, 1)
-//   每个 block 负责 C 的一个 BM×BN = 64×64 的 tile
-
+// ── Shared Memory ──────────────────────────────────────────────────────────
+//
+//   As: BM×BK = 64×8 = 512 floats = 2 KiB（矩形，非方形，因 BK≠BM）
+//   Bs: BK×BN = 8×64 = 512 floats = 2 KiB
+//   合计 4 KiB（kernel_3 为 8 KiB，差异来自 BK=8 而非 BLOCKSIZE=32）
+//
+// ── 寄存器 ────────────────────────────────────────────────────────────────
+//
+//   CUDA kernel 中所有局部变量（标量、小数组）默认分配到寄存器；
+//   cRow/cCol/threadCol/threadRow 等坐标也在寄存器，不在 global memory。
+//   local memory（global memory 的一块）只在寄存器溢出时才使用。
+//
+//   48 个寄存器的大致拆解（ptxas 实测，0 bytes spill）：
+//     threadResults[0..7]  : 8   ← TM=8 个累加器（主要目的，显式占用）
+//     tmpB                 : 1   ← 内层循环 Bs 缓存
+//     cRow, cCol           : 2   ← block tile 行列坐标
+//     threadCol, threadRow : 2   ← 计算阶段线程坐标
+//     innerRowA/ColA       : 2   ← 加载 As 的线程坐标
+//     innerRowB/ColB       : 2   ← 加载 Bs 的线程坐标
+//     bkIdx, dotIdx, resIdx: 3   ← 三层循环计数器
+//     A, B, C 指针         : 6   ← 64-bit 地址各占 2 个 32-bit 寄存器
+//     地址偏移中间量        : ~22 ← 乘加地址计算的临时结果
+//     ────────────────────────────
+//     合计约 48 个
+//
+//   每 block 寄存器：512×48 = 24576；SM 总量 65536
+//   → 每 SM 最多 2 个 block（寄存器是 occupancy 瓶颈，smem 仅 4 KiB/block 不是）
+//
+//   TM 较大时 threadResults 可能溢出（spill）到 local memory（~300 cycles/access）；
+//   TM=8 时 8 个 float 完全在寄存器内，无溢出。
+//
+// ── Grid / Block ────────────────────────────────────────────────────────────
+//
+//   gridDim = (CEIL_DIV(N,BN), CEIL_DIV(M,BM))  ← x→列，y→行（与 kernel_3 相反）
+//   blockDim = (512, 1, 1)；每个 block 负责 C 的一个 BM×BN = 64×64 tile
+// ══════════════════════════════════════════════════════════════════════════════
 template <const int BM, const int BN, const int BK, const int TM>
 __global__ void gemm1DBlocktiling(int M, int N, int K, float alpha,
                                    const float *A, const float *B, float beta,
                                    float *C) {
 
-  // ── blockIdx 方向与 kernel_3 相反：x→列，y→行 ──────
-  // kernel_3：cRow=blockIdx.x，cCol=blockIdx.y
-  // kernel_4：cRow=blockIdx.y，cCol=blockIdx.x  ← 刻意交换
+  // ── blockIdx 方向：x→列（cCol），y→行（cRow）──────────────────────────────
+  // 与 kernel_3 相反（kernel_3：cRow=blockIdx.x，cCol=blockIdx.y），性能提升约 30%
   //
-  // 原因：交换后性能提升约 30%
-  //   GPU 调度 block 时 blockIdx.x 变化最快：
-  //     linear_ID = blockIdx.y * gridDim.x + blockIdx.x
-  //     → 连续 block ID 对应 blockIdx.x = 0,1,2,...，blockIdx.y 不变
+  // 原因：GPU 调度时 blockIdx.x 变化最快（linear_ID = blockIdx.y*gridDim.x + blockIdx.x）
+  //   → 连续 block 的 blockIdx.x 递增、blockIdx.y 不变
+  //   → 相邻 block 访问相同 A 行区域，A tile 连续存储，L2 可高效复用
   //
-  // 【数值举例：M=N=K=4096, BM=BN=64，grid=64×64】
+  // 数值对比（M=N=K=4096, BM=BN=64，grid=64×64）：
   //
-  //   ✓ kernel_4（cRow=blockIdx.y, cCol=blockIdx.x）：
+  //   ✓ kernel_4（cRow=blockIdx.y, cCol=blockIdx.x）——A 行复用：
+  //   blockID  blockIdx.x  blockIdx.y  cRow  cCol  A 行范围    B 列范围
+  //      0         0           0        0     0    0.. 63     0.. 63
+  //      1         1           0        0     1    0.. 63    64..127  ← A 行相同，block 0 将 1MB A tile 加载进 L2
+  //      2         2           0        0     2    0.. 63   128..191  ← block 1~63 直接命中，A 高效复用 ✓
   //
-  //   blockID | blockIdx.x | blockIdx.y | cRow | cCol | A 行范围   | B 列范围
-  //      0    |     0      |     0      |  0   |  0   |  0.. 63  |   0.. 63
-  //      1    |     1      |     0      |  0   |  1   |  0.. 63  |  64..127  ← A 行相同，B 列不同
-  //      2    |     2      |     0      |  0   |  2   |  0.. 63  | 128..191  ← A 行相同，B 列不同
+  //   ✗ 若反转（cRow=blockIdx.x, cCol=blockIdx.y）——B 列"复用"（效率低）：
+  //   blockID  blockIdx.x  blockIdx.y  cRow  cCol  A 行范围    B 列范围
+  //      0         0           0        0     0    0.. 63     0..63
+  //      1         1           0        1     0   64..127     0..63   ← B 列相同，但 B 行间距 N=4096 float=16KB
+  //      2         2           0        2     0  128..191     0..63   ← B tile 散落 64MB 地址范围，L2 命中率低 ✗
+  //                                            A 各 block 行范围不同，无复用，每次读 1MB ✗
   //
-  //   A tile（行0..63 全部K列）：64行×4096列×4B = 1MB，连续存储
-  //   → block 0 将这 1MB 加载进 L2，block 1~63 直接命中 → A 高效复用
-  //   B tile：每个 block 列范围不同，无 cross-block 复用（但无妨，见下文）
+  // 根本原因：A tile（连续行）内存紧凑，L2 友好；B tile（行间距大）地址分散，L2 不友好
+  //   → 复用 A 远比复用 B 有价值
   //
-  //   ✗ 若反过来（cRow=blockIdx.x, cCol=blockIdx.y）：
-  //
-  //   blockID | blockIdx.x | blockIdx.y | cRow | cCol | A 行范围   | B 列范围
-  //      0    |     0      |     0      |  0   |  0   |  0.. 63  |  0..63
-  //      1    |     1      |     0      |  1   |  0   | 64..127  |  0..63   ← B 列相同，A 行不同
-  //      2    |     2      |     0      |  2   |  0   |128..191  |  0..63   ← B 列相同，A 行不同
-  //
-  //   B tile（全部K行，列0..63）：看似可复用，但 B 是行主序存储：
-  //     每行的列0..63 与下一行的列0..63 相距 N=4096 个 float = 16KB
-  //     4096行 × 16KB 间距 → B tile 数据散落在 64MB 地址范围内
-  //     → L2 cache line 极度分散，"复用"效率极低
-  //   A tile：每个 block 行范围不同，无复用，且每次都要读新的 1MB
-  //   → 两者均无高效复用 → 慢 30%
-  //
-  // 【根本原因：A tile 连续，B tile 分散】
-  //   A[cRow*BM..(cRow+1)*BM-1][:]：BM 个连续行 → 内存中紧凑的连续块 → L2 友好
-  //   B[:][cCol*BN..(cCol+1)*BN-1]：每行取 BN 列，行间距 N float = 16KB → 地址分散 → L2 不友好
-  //   因此复用 A（kernel_4）远比复用 B（反转）更有价值
-
-  //
-  // 【Global memory 访问的物理单位：sector 与 cache line】
-  //
-  //   L2 命中（数据已在缓存中）：
-  //     以 sector（32字节 = 8个float）为单位返回数据
-  //     warp 请求哪些 sector，L2 直接返回，不访问 DRAM
-  //
-  //   L2 未命中（数据不在缓存中）：
-  //     以 cache line（128字节 = 4个sector）为单位从 DRAM 加载到 L2
-  //     再将所需 sector 返回给线程
-  //     其余 sector 也留在 L2，后续访问若能复用则值得，否则是带宽浪费
-  //
-  //   coalesced 访问的意义（以 Bs 加载为例，warp 读连续 32 个 float = 128字节）：
-  //     L2 未命中：1次 DRAM 事务取 128字节（1 cache line = 4 sector），全部有用
-  //     带宽利用率 128/128 = 100% ✓
-  //
-  //   若跨步访问（32线程各访问不同 cache line）：
-  //     L2 未命中：最多 32次 DRAM 事务，每次取 128字节，实际只用 4字节
-  //     带宽利用率 4/128 = 3%，浪费 97% ✗
+  // 【Global memory 物理访问单位】
+  //   L2 命中：以 sector（32 字节 = 8 float）为单位返回数据
+  //   L2 未命中：以 cache line（128 字节 = 4 sector）为单位从 DRAM 加载，再返回所需 sector
+  //   coalesced 访问（warp 读连续 32 float = 128 字节）：
+  //     1 次 DRAM 事务取 128 字节，全部有用，带宽利用率 100% ✓
+  //   跨步访问（32 线程各访问不同 cache line）：
+  //     最多 32 次 DRAM 事务，每次取 128 字节，实际只用 4 字节，利用率 3% ✗
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
-  // ── 计算阶段的线程坐标（对应 C tile 内的位置）───────
-  // blockDim.x = BM*BN/TM = 512，线程一维排列
-  // 每个线程负责 C tile 内固定1列（threadCol）× TM 行（由 threadRow 行组决定）
+  // ── 计算阶段的线程坐标（C tile 内的位置）────────────────────────────────
+  // 【关键】threadCol → 直接是列下标；threadRow → 行组编号（需 ×TM 才是实际行号）
   //
-  // 线程被映射到一个 (BM/TM) × BN 的二维网格（行主序展开）：
-  //   行维度：BM/TM = 8 个行组（每组覆盖 TM=8 行）
-  //   列维度：BN = 64 个列
+  // blockDim.x = BM*BN/TM 个线程，映射到 (BM/TM)×BN 的二维网格（行主序）：
+  //   列维度：BN = 64；行维度：BM/TM = 8 个行组
   //
-  // 1D→2D 行主序公式：col = id % 列数，row = id / 列数 → 除数是【列数】，不是行数
-  //   直觉：行主序中连续 id 先填满一行的所有列（BN 个），填完才换行
-  //         → 每隔 BN 个 id，行号才 +1 → 必须除以列数 BN
+  // 1D→2D 行主序：col = id % 列数，row = id / 列数（除数是列数 BN，不是行数 BM/TM）
+  //   直觉：连续 id 先填满 BN 个列才换行 → 每隔 BN 个 id 行号才 +1
   //
-  // threadCol = threadIdx.x % BN：该线程负责的【列号】，0..BN-1 = 0..63
-  //   threadCol 直接就是 C tile 内的列下标，无需换算，直接用于写回和访问 Bs
-  //   同一 threadCol 值出现 BM/TM 次（每列对应 BM/TM 个线程，各负责该列的不同行组）
+  // threadCol = threadIdx.x % BN → 0..63（C tile 列下标，直接用于访问 Bs 和写回 C）
+  //   同一 threadCol 出现 BM/TM 次（每列对应 BM/TM 个线程，负责该列的不同行组）
   //
-  // threadRow = threadIdx.x / BN：该线程所属的【行组编号】，0..BM/TM-1 = 0..7
-  //   范围推导：blockDim.x = BM/TM * BN，故 threadIdx.x 最大为 BM/TM*BN - 1
-  //     threadRow_max = (BM/TM*BN - 1) / BN = BM/TM - 1 = 7 ✓
-  //   threadRow 是行组编号，不是实际行号，需要换算：
-  //   实际行号 = threadRow * TM + resIdx（resIdx 在计算循环中从 0 遍历到 TM-1）
-  //   该线程处理的实际行范围：[threadRow*TM, threadRow*TM+TM-1]
+  // threadRow = threadIdx.x / BN → 0..7（行组编号，不是实际行号！）
+  //   范围推导：blockDim.x = BM/TM*BN，最大 threadIdx.x = BM/TM*BN-1
+  //     threadRow_max = (BM/TM*BN-1)/BN = BM/TM-1 = 7 ✓
+  //   实际行号 = threadRow * TM + resIdx（resIdx 在计算循环中 0→TM-1）
+  //   该线程处理行范围：[threadRow*TM, threadRow*TM+TM-1]
   //
-  // threadCol 与 threadRow 不对称：
-  //   threadCol → 直接是列下标（每线程 1 列，无需 ×TN）
-  //   threadRow → 行组编号（每线程 TM 行，需要 ×TM + resIdx 才得实际行号）
+  // 不对称性：threadCol 直接用（每线程 1 列，无需换算）；threadRow 需 ×TM（每线程 TM 行）
+  //   设计原因：每线程固定 1 列（负责 TM 行），列宽 = BN → 用 BN 做模/除
+  //   若改为固定 1 行（负责 TM 列）：threadRow = threadIdx.x % BM，threadCol = threadIdx.x / BM
+  //   错误写法：threadIdx.x / (BM/TM) = threadIdx.x / 8 → 结果 0..63，超行组上限 7 ✗
+  //             （除数必须是列数 BN，不是行数 BM/TM）
   //
-  // 注意：不是 threadIdx.x / (BM/TM)
-  //   threadIdx.x / 8 → 结果范围 0..63，远超行组上限 BM/TM-1=7 ✗
-  //   原因：(BM/TM) 是行数，行主序中除数必须是列数 BN，不是行数
-  //
-  // 为什么用 BN 不用 BM？
-  //   因为设计是"每线程固定1列（沿 N 方向），负责 TM 行"：
-  //     列有 BN=64 个可能值 → 列维度宽度 = BN → 用 BN 做模/除
-  //   若改为"每线程固定1行，负责 TN 列"（N 方向 tiling），则反过来：
-  //     threadRow = threadIdx.x % BM（行数做模），threadCol = threadIdx.x / BM
-  //
-  // 与 innerColB/innerRowB 的关系：
-  //   innerColB = threadIdx.x % BN，innerRowB = threadIdx.x / BN
-  //   → 与 threadCol/threadRow 公式完全相同，因为 B tile 列宽 = C tile 列宽 = BN
+  // 与加载坐标的关系：innerColB = threadIdx.x % BN，innerRowB = threadIdx.x / BN
+  //   公式与 threadCol/threadRow 完全相同，因为 Bs 列宽 = C tile 列宽 = BN
   //
   // 示例（BN=64, TM=8）：
-  //   threadIdx.x=0:   threadCol=0,  threadRow=0（行组0）→ 实际行 0*8+resIdx = 0..7,  列0
-  //   threadIdx.x=1:   threadCol=1,  threadRow=0（行组0）→ 实际行 0*8+resIdx = 0..7,  列1
-  //   threadIdx.x=64:  threadCol=0,  threadRow=1（行组1）→ 实际行 1*8+resIdx = 8..15, 列0
+  //   threadIdx.x=0:  threadCol=0, threadRow=0 → 行 0*8+resIdx=0..7,  列0
+  //   threadIdx.x=1:  threadCol=1, threadRow=0 → 行 0*8+resIdx=0..7,  列1
+  //   threadIdx.x=64: threadCol=0, threadRow=1 → 行 1*8+resIdx=8..15, 列0
   const int threadCol = threadIdx.x % BN;
   const int threadRow = threadIdx.x / BN;
 
-  // ── shared memory 分配 ────────────
-  // As: BM×BK = 64×8，存储 A 当前 tile（矩形，非方形）
-  // Bs: BK×BN = 8×64，存储 B 当前 tile（矩形，非方形）
-  // kernel_3 的 As/Bs 是方形（BLOCKSIZE×BLOCKSIZE），此处因 BK≠BM/BN 变为矩形
+  // ── Shared Memory ──────────────────────────────────────────────────────
+  // As: BM×BK = 64×8（矩形，非方形，因 BK≠BM）
+  // Bs: BK×BN = 8×64（矩形，非方形，因 BK≠BN）
   __shared__ float As[BM * BK];
   __shared__ float Bs[BK * BN];
 
-  // ── 将指针推进到本 block 负责区域的起始位置 ───────
-  // A：跳过 cRow*BM 行（每行 K 个元素）→ A += cRow*BM*K
-  // B：跳过 cCol*BN 列（在第 0 行内偏移）→ B += cCol*BN
-  // C：跳过 cRow*BM 行 + cCol*BN 列 → C += cRow*BM*N + cCol*BN
+  // ── 将指针推进到本 block 负责区域的起始位置 ──────────────────────────
+  // A += cRow*BM*K（跳过 cRow*BM 行，每行 K 元素）
+  // B += cCol*BN  （跳过 cCol*BN 列，在第 0 行内偏移）
+  // C += cRow*BM*N + cCol*BN
   A += cRow * BM * K;
   B += cCol * BN;
   C += cRow * BM * N + cCol * BN;
 
-  // ── assert：验证线程数与 tile 大小匹配 ────────────
-  // 每个线程加载 As 的 1 个元素，需要 BM*BK 个线程
-  // 每个线程加载 Bs 的 1 个元素，需要 BK*BN 个线程
-  // blockDim.x 必须同时满足两个要求，因此 BM*BK = BN*BK = blockDim.x
+  // assert：验证 BM*BK = BN*BK = blockDim.x，确保每线程恰好负责加载 As/Bs 各 1 个元素
   assert(BM * BK == blockDim.x);
   assert(BN * BK == blockDim.x);
 
-  // ── 加载阶段的线程坐标（用于协作加载 As/Bs，与计算阶段坐标不同）───────────
+  // ── 加载阶段的线程坐标（协作加载 As/Bs，与计算阶段坐标独立）──────────────
   //
-  // As 加载坐标（BM×BK 视角）：
-  //   As 是 BM×BK = 64×8 的矩阵，需要把线性 threadIdx.x（0..511）映射为 (row, col)
+  // 1D→2D 行主序：col = id % 列数，row = id / 列数（除数是列数，不是行数）
   //
-  //   一维→二维的通用公式（行主序）：
-  //     col = id % 列数     row = id / 列数   ← 除数是列数，不是行数
+  // As（BM×BK，列数=BK=8）：
+  //   innerColA = threadIdx.x % BK → 0..7  = 0..BK-1 ✓
+  //   innerRowA = threadIdx.x / BK → 0..63 = 0..BM-1 ✓
+  //   注意：不是 /BM（除以 64 结果只有 0..7，覆盖不了 BM=64 行）✗
+  //   coalesced：BK=8，warp 内每 8 线程访问同一行连续 8 元素（64 B），需 4 次事务
   //
-  //   As 列数 = BK = 8：
-  //     innerColA = threadIdx.x % BK = threadIdx.x % 8  → 0..7  = 0..BK-1 ✓
-  //     innerRowA = threadIdx.x / BK = threadIdx.x / 8  → 0..63 = 0..BM-1 ✓
-  //
-  //   为什么不是 threadIdx.x / BM（除以行数）？
-  //     threadIdx.x / 64 → 结果只有 0..7，覆盖不了 64 行 ✗
-  //     必须除以列数 BK=8，步长才与列宽匹配，行号才能跑满 0..63
-  //
-  //   → 512 线程覆盖 As 的全部 BM*BK=512 个元素，一一对应
-  //
-  //   coalesced 分析（BK=8）：
-  //   warp 内 32 个线程，innerColA = threadIdx.x % 8，innerRowA = threadIdx.x / 8
-  //   → 线程 0..7 访问 A[row0][0..7]，线程 8..15 访问 A[row1][0..7]，...
-  //   → 每组 8 线程访问同一行连续 8 个元素（64 bytes），但 4 组行不同
-  //   → 需要 4 次内存事务（非完全 coalesced），但硬件可合并相邻事务
-  //
-  // Bs 加载坐标（BK×BN 视角）：
-  //   Bs 是 BK×BN = 8×64 的矩阵，列数 = BN = 64：
-  //     innerColB = threadIdx.x % BN = threadIdx.x % 64 → 0..63 = 0..BN-1 ✓
-  //     innerRowB = threadIdx.x / BN = threadIdx.x / 64 → 0..7  = 0..BK-1 ✓
-  //
-  //   为什么不是 threadIdx.x / BK（除以行数）？
-  //     threadIdx.x / 8 → 结果是 0..63，远超 Bs 的 8 行范围 ✗
-  //     必须除以列数 BN=64，行号才能恰好覆盖 0..7
-  //
-  //   → 512 线程覆盖 Bs 的全部 BK*BN=512 个元素，一一对应
-  //
-  //   coalesced 分析（BN=64）：
-  //   warp 内 32 个线程，innerColB = threadIdx.x % 64 = 0..31（连续）
-  //   innerRowB = threadIdx.x / 64 = 0（全 warp 相同）
-  //   → 访问 B 同一行连续 32 个元素 → 完全 coalesced ✓
+  // Bs（BK×BN，列数=BN=64）：
+  //   innerColB = threadIdx.x % BN → 0..63 = 0..BN-1 ✓
+  //   innerRowB = threadIdx.x / BN → 0..7  = 0..BK-1 ✓
+  //   注意：不是 /BK（除以 8 结果是 0..63，超过 Bs 的 BK=8 行范围）✗
+  //   coalesced：BN=64，warp 内 threadIdx.x=0..31 → innerColB=0..31 连续 → 完全 coalesced ✓
   const uint innerColA = threadIdx.x % BK;
   const uint innerRowA = threadIdx.x / BK;
   const uint innerColB = threadIdx.x % BN;
   const uint innerRowB = threadIdx.x / BN;
 
-  // ── 每个线程的寄存器累加器：存储 TM 个 C 元素的部分和 ────────────────────
+  // TM 个 C 元素的部分和累加器，全部驻寄存器（512 线程×8 = 4096 个/block）
   // threadResults[resIdx] 对应 C tile 内 (threadRow*TM + resIdx, threadCol) 位置
-  // 共 TM=8 个，全部存在寄存器中（不进 shared memory，不进 global memory）
-  // 512 线程 × 8 = 4096 个累加器，均摊到寄存器堆
-
-
-
-  // 【48 个寄存器都存了什么？——所有局部变量默认都在寄存器中】
-  //
-  // 误区：cRow/cCol/threadCol/threadRow 不在 global memory 中，而是在寄存器里
-  //   CUDA kernel 中所有局部变量（标量、小数组）默认分配到寄存器
-  //   global memory 只存放：传入的矩阵指针所指向的 A/B/C 数组本身
-  //   "local memory"（global memory 的一块）只在寄存器溢出（spill）时才使用
-  //   本 kernel：0 bytes spill stores, 0 bytes spill loads → 无溢出，所有局部量在寄存器
-  //
-  // 48 个寄存器的组成（近似拆解）：
-  //   threadResults[0..7]  : 8 个  ← TM=8 个累加器（主要目的，显式占用）
-  //   tmpB                 : 1 个  ← 内层循环 B tile 缓存
-  //   cRow, cCol           : 2 个  ← block tile 行列坐标
-  //   threadCol, threadRow : 2 个  ← 计算阶段线程坐标
-  //   innerRowA/ColA       : 2 个  ← 加载 As 的线程坐标
-  //   innerRowB/ColB       : 2 个  ← 加载 Bs 的线程坐标
-  //   bkIdx, dotIdx, resIdx: 3 个  ← 三层循环计数器
-  //   A, B, C 指针         : 各 2 个（64-bit 地址占 2 个 32-bit 寄存器）= 6 个
-  //   地址偏移中间量        : ~10 个 ← 各种乘加地址计算的临时结果
-  //   ─────────────────────────────
-  //   合计约 48 个（ptxas 实测值）
-  //
-  // 什么时候需要寄存器：
-  //   所有 kernel 内的局部变量（标量/小数组）→ 编译器自动分配寄存器
-  //   循环计数器、指针、中间计算值 → 均在寄存器
-  //
-  // 什么时候不用寄存器（或寄存器不够用时）：
-  //   1. __shared__ 变量：显式放在 shared memory，不占寄存器
-  //   2. 寄存器溢出（spill）：局部变量太多超过每线程上限（255个）时
-  //      编译器将部分变量存到 local memory（实为 global memory）
-  //      ptxas 报告 "N bytes spill stores/loads"，每次访问代价 ~300 cycles
-  //   3. 大数组：threadResults[TM] 若 TM 很大，编译器可能将其放入 local memory
-  //      TM=8 时 8 个 float 完全可以放入寄存器 → 无溢出
-  //
-  // 寄存器数量对 occupancy 的影响（sm_86）：
-  //   每个 SM 共 65536 个寄存器，每个线程 48 个
-  //   每 block 512 线程 × 48 = 24576 个寄存器/block
-  //   65536 / 24576 ≈ 2.67 → 每个 SM 最多同时驻留 2 个 block
-  //   （shared memory 4 KiB/block，100 KiB / 4 KiB = 25，不是瓶颈）
-  //   → 寄存器是此 kernel 的 occupancy 瓶颈
   float threadResults[TM] = {0.0};
 
-  // ── 主循环：沿 K 方向逐 tile 累加 
+  // ── 主循环：沿 K 方向逐 tile 累加 ─────────────────────────────────────
   for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
 
-    // ── 协作加载：每线程加载 As/Bs 各一个元素 ─────
+    // 协作加载：每线程加载 As/Bs 各一个元素
     // As[innerRowA][innerColA] ← A[innerRowA][bkIdx + innerColA]
-    // Bs[innerRowB][innerColB] ← B[bkIdx + innerRowB][cCol*BN + innerColB]
-    // （A/B 指针已推进，直接用相对偏移）
+    // Bs[innerRowB][innerColB] ← B[bkIdx + innerRowB][innerColB]
+    // （A/B 指针已推进到本 block 起始，直接用相对偏移；此版本不做边界检查）
     As[innerRowA * BK + innerColA] = A[innerRowA * K + innerColA];
     Bs[innerRowB * BN + innerColB] = B[innerRowB * N + innerColB];
     __syncthreads();
 
-    // ── 推进指针到下一个 k_tile ───
-    A += BK;        // A 沿列方向推进 BK 列
-    B += BK * N;    // B 沿行方向推进 BK 行
+    // 推进指针到下一个 K tile
+    A += BK;      // A 沿列方向推进 BK 列
+    B += BK * N;  // B 沿行方向推进 BK 行
 
-    // ── 点积计算：dotIdx 为外层，resIdx 为内层 ────
-    // 【关键优化：dotIdx 外层，tmpB 缓存在寄存器，被 TM 个线程结果复用】
+    // ── 点积计算：dotIdx 外层，resIdx 内层 ─────────────────────────────
+    // 【dotIdx 必须在外层】：
+    //   固定 dotIdx 时 Bs[dotIdx*BN+threadCol] 地址不变 → 读一次存 tmpB，复用 TM 次
+    //   若 resIdx 在外层：每个 resIdx 迭代重新读 Bs → TM 倍 smem 读，收益消失
     //
-    // 对每个 dotIdx（BK 方向）：
-    //   tmpB = Bs[dotIdx][threadCol]：从 shared memory 读一次，存入寄存器
-    //   对 TM 个 resIdx：
-    //     threadResults[resIdx] += As[threadRow*TM+resIdx][dotIdx] * tmpB
-    //     ↑ As 每次从 shared memory 读，共读 TM 次（不同行）
-    //     ↑ tmpB 直接从寄存器读，复用 TM 次（0 次 shared memory 访问）
+    // Bs bank conflict（结论：无）：
+    //   warp 内 threadIdx.x=0..31 → threadCol=0..31（BN=64，连续不回绕）
+    //   Bs[dotIdx*BN+0..31]：同一行连续 32 float → 32 个不同 bank ✓
     //
-    // 若 dotIdx 为内层（resIdx 外层）：
-    //   每个 resIdx 迭代都需要重新从 shared memory 读 tmpB → TM 倍读取开销
-    //   现在 dotIdx 外层：tmpB 只读一次，复用 TM 次 → shared memory 读减少 TM 倍
-    //
-    // Bs bank conflict 分析：
-    //   warp 内所有线程 threadCol = threadIdx.x % BN，BN=64 > 32
-    //   warp 内 threadIdx.x=0..31 → threadCol=0..31（连续）
-    //   Bs[dotIdx * BN + threadCol]：dotIdx 相同，threadCol=0..31 连续
-    //   → 访问同一行连续 32 个 float → 32 个不同 bank → 无 bank conflict ✓
-    //
-    // As bank conflict 分析（结论：无 bank conflict）：
-    //
-    // bank conflict 的前提是：同一 warp 内不同线程在【同一时刻】访问同一 bank 的不同地址。
-    // resIdx 是 for 循环变量，每次迭代是串行（SIMD 步进），不是并发访问，不构成 bank conflict。
-    //
-    // 分析 warp 内各线程在同一时刻的 As 访问地址：
-    //   地址 = As[(threadRow * TM + resIdx) * BK + dotIdx]
-    //   threadRow = threadIdx.x / BN，BN=64 > warp_size=32
-    //   → warp 内 threadIdx.x=0..31 全部 / 64 = 0 → threadRow 均为 0
-    //   → 同一 resIdx、dotIdx 时，warp 内 32 个线程访问同一地址
-    //   → SMEM 广播（broadcast），无 bank conflict ✓
-    //
-    // 若 BN < warp_size（如 BN=8）：
-    //   threadIdx.x=0..31 → threadRow=0,0,..,0,1,1,..,3（每 8 个线程 threadRow 递增 1）
-    //   不同线程 threadRow 不同 → 地址间距 TM*BK=64 bytes → 不同 bank 组合 → 有 bank conflict
+    // As bank conflict（结论：无）：
+    //   resIdx 是串行循环变量（SIMD 步进），不构成并发访问，不存在 bank conflict
+    //   同一时刻 warp 内 threadIdx.x=0..31，threadRow = threadIdx.x/BN，BN=64 > 32
+    //   → 全部 /64 = 0 → threadRow 均为 0 → 32 线程访问同一地址 → SMEM 广播 ✓
+    //   （若 BN < 32，如 BN=8：不同线程 threadRow 不同 → 有 bank conflict）
     for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
-      // 【为什么 Bs 缓存到寄存器，而 As 不用？】
-      //
-      // 固定 dotIdx，看内层 resIdx 循环的访问地址：
-      //   Bs[dotIdx * BN + threadCol]：dotIdx 固定，threadCol 固定
-      //     → TM 次迭代访问的是同一个地址 → 常量 → 读一次存 tmpB，复用 TM=8 次
-      //   As[(threadRow * TM + resIdx) * BK + dotIdx]：resIdx 每次 +1
-      //     → TM 次迭代访问 TM 个不同地址 → 变量 → 无论如何都要读 TM 次，缓存无意义
-      //
-      // 缓存 tmpB 的收益（per dotIdx 迭代）：
-      //   Bs shared memory 读：1次（缓存）vs 8次（不缓存）→ 省 7 次
-      //   As shared memory 读：8次（不变）
+      // Bs 固定地址读一次，缓存到寄存器；As 地址随 resIdx 变化，每次从 smem 读
       float tmpB = Bs[dotIdx * BN + threadCol];
       for (uint resIdx = 0; resIdx < TM; ++resIdx) {
         threadResults[resIdx] +=
             As[(threadRow * TM + resIdx) * BK + dotIdx] * tmpB;
       }
     }
-    __syncthreads();
+    __syncthreads();  // 防止快线程进入下一 tile 提前覆盖 As/Bs
   }
 
-  // ── 写回结果：每个线程写 TM 个 C 元素 ──────
-  // (threadRow*TM + resIdx) 是 C tile 内的行，threadCol 是 C tile 内的列
-  // resIdx=0..TM-1：连续 TM 行，每次写一个元素
+  // ── 写回结果：每线程写 TM 个 C 元素 ────────────────────────────────────
+  // C tile 内行 = threadRow*TM + resIdx，列 = threadCol
   //
-  // coalesced 分析：
-  //   warp 内 threadCol=0..31 连续，(threadRow*TM+resIdx) 相同
-  //   → C 同一行连续 32 个元素 → coalesced ✓
-
-  // 对 threadIdx.x=0（threadRow=0, threadCol=0，TM=8）：
-  // ┌────────┬────────────────────────────────────┬──────────┐
-  // │ resIdx │ 写入的行 = threadRow × TM + resIdx │ 写入的列    │
-  // ├────────┼────────────────────────────────────┼──────────┤
-  // │ 0      │ 0×8+0 = 行 0                       │ 列 0      │
-  // ├────────┼────────────────────────────────────┼──────────┤
-  // │ 1      │ 0×8+1 = 行 1                       │ 列 0      │
-  // ├────────┼────────────────────────────────────┼──────────┤
-  // │ 2      │ 0×8+2 = 行 2                       │ 列 0      │
-  // ├────────┼────────────────────────────────────┼──────────┤
-  // │ ...    │ ...                                │ ...      │
-  // ├────────┼────────────────────────────────────┼──────────┤
-  // │ 7      │ 0×8+7 = 行 7                       │ 列 0      │
-  // └────────┴────────────────────────────────────┴──────────┘
-  // 所以 threadIdx.x=0 确实写了行 0~7、列 0，共 8 个元素，这正是 1D Blocktiling 的核心：每个线程不再只算 1 个 C 元素，而是算 TM=8 个（沿 M 方向连续的 8 行）。threadResults[TM] 这 8 个累加器对应的就是这 8 行。
+  // coalesced：warp 内 threadCol=0..31 连续，(threadRow*TM+resIdx) 相同
+  //   → C 同一行连续 32 个元素，1 次 DRAM 事务 ✓
+  //
+  // 示例（threadIdx.x=0，threadRow=0, threadCol=0，TM=8）：
+  // ┌────────┬────────────────────────┬────────┐
+  // │ resIdx │ 行 = threadRow*TM+resIdx│ 列     │
+  // ├────────┼────────────────────────┼────────┤
+  // │   0    │         0              │   0    │
+  // │   1    │         1              │   0    │
+  // │  ...   │        ...             │  ...   │
+  // │   7    │         7              │   0    │
+  // └────────┴────────────────────────┴────────┘
+  // → 该线程写了行 0~7、列 0 共 8 个元素——1D Blocktiling 的核心：每线程负责 TM 行
   for (uint resIdx = 0; resIdx < TM; ++resIdx) {
     C[(threadRow * TM + resIdx) * N + threadCol] =
         alpha * threadResults[resIdx] +
@@ -398,6 +262,59 @@ __global__ void gemm1DBlocktiling(int M, int N, int K, float alpha,
 }
 
 
+// ══════════════════════════════════════════════════════════════════════════════
+// gemm1DBlocktiling_v2：自行实现的 1D Blocktiling kernel
+//
+// 【相比 kernel_3（gemm_shared_mem_block）的改进】
+//
+// 1. 每线程计算 TM 个 C 元素（M 方向）
+//    kernel_3：每线程 1 个 C 元素，BLOCKSIZE² 个线程/block
+//    v2：每线程 TM=8 个 C 元素，BM*BN/TM = 512 个线程/block
+//
+// 2. tmpCol 寄存器缓存，减少 shared memory 读取
+//    kernel_3：每次点积都从 smem 读 Bs，无复用
+//    v2：Bs[colIdx*BN+threadCol] 读入寄存器 tmpCol，在 TM 次 rowIdx 迭代中复用
+//    收益：每个 colIdx 省 TM-1 次 smem 读，共节省 (TM-1)*BK 次/tile
+//
+// 3. threadResults[TM] 寄存器累加器
+//    kernel_3：单个 temp 寄存器；v2：TM 个累加器全驻寄存器，无 smem 中间写回
+//
+// 4. 完整的 M/N/K 三方向边界检查
+//    kernel_3 v1：无 M/N 边界检查，非整数倍维度时越界读
+//    v2：加载用三元掩码（越界填 0），写回逐行 if 过滤，__syncthreads() 在 if 外
+//
+// ══════════════════════════════════════════════════════════════════════════════
+// 【编写过程中的典型错误总结】
+//
+// 错误类1：block 编号与元素索引混淆
+//   initRowGroup/initColGroup 是 block 编号，不是元素位置
+//   全局行 = initRowGroup * BM + innerROWForAs（必须乘以 BM）
+//   全局列 = initColGroup * BN + innerCOLForBs（必须乘以 BN）
+//
+// 错误类2：SMEM 步长用错矩阵维度
+//   As 是 BM×BK → 步长 = BK：As[innerROWForAs * BK + innerCOLForAs]
+//   Bs 是 BK×BN → 步长 = BN：Bs[innerROWForBs * BN + innerCOLForBs]
+//   曾错误地用 BK 作为 Bs 的步长
+//
+// 错误类3：B 的行列方向混淆
+//   B 是 K×N 矩阵：行方向 = K，列方向 = N，步长 = N
+//   曾在 B 行号中混入 M 方向的 initRowGroup（B 与 M 无关）
+//   曾将步长写成 K（应为 N）
+//
+// 错误类4：__syncthreads() 在条件 if 内部 → 死锁
+//   同一 block 内不同线程边界条件不同，if 内的 syncthreads 只被部分线程调用
+//   正确做法：加载和两个 __syncthreads() 必须在任何 if 外，所有线程都执行
+//
+// 错误类5：循环结构错误
+//   = + 写成赋值而非 +=，导致只保留最后一次 colIdx 的结果
+//   写回放在 K tile 循环内，导致 beta 被多次乘（应在循环外统一写回）
+//   第二个 __syncthreads() 遗漏，导致快线程覆盖慢线程还在读的 As/Bs
+//
+// 错误类6：边界条件不完整
+//   threadRowGroup 是行组编号，边界检查需乘以 TM 才得起始行
+//   innerROWForAs 和 threadRowGroup 是同一 threadIdx.x 的两套独立映射
+//   写回检查不能保护 A 加载，两者各自独立保护不同内存访问
+// ══════════════════════════════════════════════════════════════════════════════
 template <const int BM, const int BN, const int BK, const int TM>
 __global__ void gemm1DBlocktiling_v2(int M, int N, int K, float alpha,
                                    const float *A, const float *B, float beta,

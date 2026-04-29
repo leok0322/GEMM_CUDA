@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
     if (kernel_num != 0) {
       try {
         bool record {false};
-        if (kernel_num == 3 && m == SIZE[0]) {
+        if ((kernel_num == 3  || kernel_num == 5) && m == SIZE[0]) {
           record = true;
         }
         run_kernel(0, m, n, k, alpha, dA, dB, beta, dC_ref,

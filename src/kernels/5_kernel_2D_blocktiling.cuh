@@ -674,8 +674,13 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
 // ─────────────────────────────────────────────────────────────────────────────
 template <const int BM, const int BN, const int BK, const int TM, const int TN, const bool BOUNDARY>
 __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
+  // __global__ kernel 参数不能是引用（const uint& offsetCol 会导致 illegal memory access）：
+  //   引用底层是指针，指向主机内存地址。
+  //   CUDA runtime 将参数按值复制到设备常量内存后分发给每个线程。
+  //   若传引用，GPU 线程解引用时访问的是主机内存地址 → illegal memory access。
+  //   kernel 参数只能是值类型或设备指针。
   gemm2DBlocktiling_v3(int M, int N, int K, float alpha, const float *A,
-                   const float *B, float beta, float *C, const uint& offsetCol, const uint& offsetRow) {
+                   const float *B, float beta, float *C, const uint offsetCol, const uint offsetRow) {
 
   // 起始行
   const uint InitRow  = (blockIdx.y + offsetRow) * BM;

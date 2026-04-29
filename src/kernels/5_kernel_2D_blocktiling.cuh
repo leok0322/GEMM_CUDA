@@ -414,7 +414,7 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
 
 
   // 每个线程寄存器寄存乘积累加数组，处理TM * TN个数组
-  float treadResultArr[TM * TN];
+  float treadResultArr[TM * TN] {};
   // 循环K列
   for (uint Idx = 0; Idx < K; Idx+=BK) {
     // ── 填充节奏 ────────────────────────────────────────────────────────────────
@@ -606,4 +606,330 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   }
 
 
+}
+
+
+// ── 为什么 offsetCol / offsetRow 不能作为模板参数 ────────────────────────────
+// template 参数必须是编译期常量（integral constant expression）。
+// 调用处的值是 N/BN、M/BM，其中 N、M 是运行期参数（int）。
+// 例如 gemm2DBlocktiling_v3<BM,BN,BK,TM,TN,true, N/BN, 0>  // 错误！
+//   编译报错：error: expression must have a constant value
+//             "Substitution failed: expression is not an integral constant expression"
+// 因此只能作为普通 kernel 参数在运行期传入。
+//
+// ── N/BN 的类型：int 除以 uint ────────────────────────────────────────────────
+// C++ 隐式算术转换规则（usual arithmetic conversions）：
+//   int 与 unsigned int 混合运算时，int 被隐式转换为 unsigned int，结果为 unsigned int。
+//   故 N/BN（int/uint）→ uint。
+//   调用处写 N/BN 时：N 先隐式转换为 uint，再做无符号整除，结果类型为 uint。
+//   若 N 为负数则会产生下溢（wraparound），但矩阵尺寸不会为负，此处安全。
+//
+// ── offsetCol / offsetRow 声明为 const uint，"const" 是运行期只读，非编译期常量 ──
+//   C++ 中 const 有两种含义：
+//     ① 编译期常量（constexpr）：值在编译期已知，可作为模板参数、数组长度
+//     ② 运行期只读（const）     ：值在运行期确定，但承诺不再修改
+//   此处的 const uint offsetCol 是②：值由调用者在运行期传入，函数内不可修改。
+//   它 **不能** 作为模板参数，因为模板实例化发生在编译期，此时值未知。
+//
+// ── uint 传给 const uint（值传参）vs uint* 传给 const uint*（指针传参）────────
+//   两者的 const 加在不同层，行为截然不同：
+//
+//   顶层 const（top-level const）：const 修饰对象本身
+//     void f(const uint x)
+//     调用方传 uint，函数拿到副本，const 只限制函数内部不能写 x。
+//     uint 和 const uint 在函数签名上等价，对重载决议透明，不产生转换。
+//
+//   底层 const（low-level const）：const 修饰指针所指向的内容
+//     void f(const uint* p)
+//     uint* 和 const uint* 是两个不同的指针类型。
+//     uint* → const uint* 是真正的类型转换（qualification conversion，资格转换）：
+//       指针类型本身从"可读可写"变为"只读"，编译器隐式允许（只加限制不减权限）。
+//     反向 const uint* → uint* 需要 const_cast，编译器禁止隐式进行。
+//
+//   本文件中 const float *A 即底层 const：A 所指内容只读，A 本身可以移动（A += BK）。
+//
+//   总结：
+//     uint   → const uint   （值）  ：不是转换，顶层 const 被忽略
+//     uint*  → const uint*  （指针）：是转换，qualification conversion
+//
+// ── 模板参数的"传参"是编译期复制初始化 ──────────────────────────────────────
+//   非类型模板参数的传参本质是初始化（initialization），语义等同赋值，但发生在编译期：
+//     gemm2DBlocktiling_v3<128, 128, 8, 8, 8, false>
+//     ≡ constexpr int BM = 128;  constexpr int BN = 128; ...  （编译期常量初始化）
+//   实参被复制进模板参数，模板体内 BM 就是值为 128 的编译期常量。
+//   与运行期值传参对比：
+//     值参数  void f(uint x)       → 运行期复制，每次调用独立
+//     引用参数 void f(uint& x)     → 运行期绑定，不复制
+//     模板参数 template <int BM>   → 编译期复制，每种值生成一份独立代码
+//
+// ── 模板参数能否用 constexpr 限定 ────────────────────────────────────────────
+//   template <constexpr int BM>   // ❌ 语法错误，constexpr 不是合法的模板参数限定符
+//   template <const int BM>       // ✓ 合法，但 const 是多余的（模板参数本身就不可修改）
+//   template <int BM>             // ✓ 推荐写法
+//
+//   原因：C++ 标准规定非类型模板参数（non-type template parameter）只接受
+//     类型名、const（多余）、auto（C++17）作为限定，不接受 constexpr。
+//   constexpr 是变量/函数的存储说明符，不属于模板参数语法。
+//   虽然模板参数天然是编译期常量（语义上等同 constexpr），但语法上不能这样写。
+// ─────────────────────────────────────────────────────────────────────────────
+template <const int BM, const int BN, const int BK, const int TM, const int TN, const bool BOUNDARY>
+__global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
+  gemm2DBlocktiling_v3(int M, int N, int K, float alpha, const float *A,
+                   const float *B, float beta, float *C, const uint& offsetCol, const uint& offsetRow) {
+
+  // 起始行
+  const uint InitRow  = (blockIdx.y + offsetRow) * BM;
+  const uint InitCol  = (blockIdx.x + offsetCol) * BN;
+
+  assert(blockDim.x % (BN / TN) == 0);
+  // 当前线程负责的行组和列组
+  const uint threadRowGroup{threadIdx.x / (BN / TN)};
+  const uint threadColGroup{threadIdx.x % (BN / TN)};
+
+
+  // SMEM静态分配
+  __shared__ float As[BM * BK];
+  __shared__ float Bs[BK * BN];
+
+
+  // 保证了每个block每一轮能处理完整的As的行
+  assert(blockDim.x % BK == 0);
+  // BM * BK % blockDim.x == 0保证了BM * BK == blockDim.x * smemNum == blockDim.x * BM * BK / blockDim.x,即保证了经过n次迭代刚好能全部处理完A的所有元素
+  // assert(BM * BK == blockDim.x * smemNum);
+  assert(BM * BK % blockDim.x == 0);
+  // 保证了每个block每一轮能处理完整的Bs的行
+  assert(blockDim.x % BN == 0);
+  assert(BM == BN);
+  //保证了经过n次迭代刚好能全部处理完B的所有元素
+  assert(BK * BN % blockDim.x == 0);
+  // 每个线程负责的SMEM的迁移个数，向上取整，即迭代的次数
+  const uint smemNum {BM * BK / blockDim.x};
+  // 每次迭代中，需要跨过的行数,因为一个block的线程能处理这么多行
+  const uint strideA = blockDim.x / BK;
+  const uint strideB = blockDim.x / BN;
+
+
+  // 线程负责的SMEM元素的迁移的列和行组
+  const uint innerRowGroupAs = threadIdx.x / BK;
+  const uint innerColAs = threadIdx.x % BK;
+  const uint innerRowGroupBs = threadIdx.x / BN;
+  const uint innerColBs = threadIdx.x % BN;
+
+
+  // 每个线程寄存器寄存乘积累加数组，处理TM * TN个数组
+  // 曾错误写成：float treadResultArr[TM * TN];  （未初始化）
+  //   错误：CUDA 局部数组不自动归零，内容是该寄存器槽上一个 warp 遗留的垃圾值
+  //   后果：+= 在垃圾值上累加；垃圾值中可能含 NaN 或 inf，0×inf=NaN 向全结果扩散
+  //   运行现象：
+  //     Divergence! Should 12.04, Is   nan (Diff   nan) at 3
+  //     Failed to pass the correctness verification against NVIDIA cuBLAS.
+  //     Logging faulty output into matrixValidationFailure.txt
+  //     → exit(EXIT_FAILURE) → kernel_5_result.txt 未写入
+  float treadResultArr[TM * TN] = {0.0};
+  // 不检查边界的循环次数
+  const uint recycle = K / BK;
+  const uint remain_k = K % BK;
+
+  // ── if constexpr (BOUNDARY) 的作用 ──────────────────────────────────────────
+  //
+  // if constexpr 是 C++17 的编译期条件：BOUNDARY 是模板参数（编译期常量），
+  // 未命中的分支直接从编译结果中删除，不生成任何指令。
+  //   if constexpr (BOUNDARY=true)：只编译 true 分支，false 分支不存在于二进制中
+  //   if constexpr (BOUNDARY=false)：只编译 false 分支，true 分支不存在于二进制中
+  // 与普通 if (BOUNDARY) 的区别：
+  //   普通 if：两分支都生成代码，依赖优化器消除死分支（不保证消除）
+  //   if constexpr：未命中分支 100% 不生成指令，热路径零开销保证
+  //
+  // ── edgeGrid 不能写成 dim3(1, 1) ─────────────────────────────────────────────
+  //
+  // 以 M=256, N=260, BM=BN=128 为例：
+  //   内部 block（BOUNDARY=false）：dim3(N/BN, M/BM) = (2, 2) → 4 个 block
+  //   右边界列（N%BN!=0）：         dim3(1, CEIL_DIV(M,BM)) = (1, 2) → 2 个 block
+  //   底边界行（M%BM!=0，不含角）：  dim3(N/BN, 1) = (2, 1)         → 2 个 block
+  //
+  //   dim3 edgeGrid(1, 1) 只启动右下角 1 个 block，其余边界 block 全部漏掉 ✗
+  //   dim3 edgeGrid(CEIL_DIV(N,BN)-N/BN, CEIL_DIV(M,BM)-M/BM) 同样只有 (1,1) ✗
+  //
+  // ── M/N 边界检查正确性分析 ────────────────────────────────────────────────────
+  //
+  // BOUNDARY=true（是 M/N 方向的边界 block）：
+  //   ✓ recycle 热路径：A 加载检查 M，B 加载检查 N（recycle 循环内 K 方向始终在界内，无需 K 检查）
+  //   ✓ remain_k 块：A 加载检查 M 和 K，B 加载检查 K 和 N
+  //   ✓ C 写回：检查 M 和 N
+  //
+  // BOUNDARY=false（interior block，M/N 方向完全在矩阵内）：
+  //   ✓ recycle 热路径：无需 M/N/K 检查
+  //   ✓ remain_k 块：只检查 K，M/N 对 interior block 无需检查
+  //   ✓ C 写回：无需 M/N 检查
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // 是M\N方向的边界
+  if constexpr (BOUNDARY) {
+    for (uint dotIdx = 0; dotIdx < recycle; ++dotIdx) {
+      for (uint rowGroupIdx {}; rowGroupIdx < smemNum; ++rowGroupIdx) {
+        // ✓ M/N 检查：A 只需 M 检查，B 只需 N 检查；K 方向在 recycle 循环内始终合法
+        As[(innerRowGroupAs + rowGroupIdx * strideA) * BK + innerColAs] =  ((InitRow + innerRowGroupAs + rowGroupIdx * strideA) < M) ?A[(InitRow + innerRowGroupAs + rowGroupIdx * strideA) * K + dotIdx * BK + innerColAs]:0.0f;
+        Bs[(innerRowGroupBs + rowGroupIdx * strideB) * BN + innerColBs] =   ((InitCol + innerColBs) < N)? B[(innerRowGroupBs + rowGroupIdx * strideB + dotIdx * BK) * N  + InitCol + innerColBs]:0.0f;
+      }
+      // 等待所有线程写入SMEM完毕
+      __syncthreads();
+
+      for (uint Idx {}; Idx < BK; ++Idx) {
+        float rowTemp[TM];
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          rowTemp[rowIdx] = As[(threadRowGroup * TM +rowIdx) * BK  + Idx];
+        }
+
+        float colTemp[TN];
+        for (uint colIdx {}; colIdx < TN; ++colIdx) {
+          colTemp[colIdx] = Bs[Idx * BN + threadColGroup * TN + colIdx];
+        }
+
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          for (uint colIdx {}; colIdx < TN; ++colIdx) {
+
+            treadResultArr[rowIdx * TN + colIdx] += rowTemp[rowIdx] * colTemp[colIdx];
+          }
+        }
+      }
+
+      __syncthreads();
+    }
+
+
+    if (remain_k > 0) {
+      // 曾错误写成（边界条件缺少 * BK）：
+      //   As 条件：recycle + innerColAs < K
+      //     错误：recycle 是 tile 数量，不是元素偏移；元素偏移 = recycle * BK
+      //     正确：recycle * BK + innerColAs < K
+      //   Bs 条件：innerRowGroupBs + rowGroupIdx * strideB + recycle < K
+      //     同理，错误：recycle 应为 recycle * BK
+      //     正确：innerRowGroupBs + rowGroupIdx * strideB + recycle * BK < K
+      //   地址计算（recycle * BK）两处都写对了，只有条件判断漏了 * BK
+      //
+      // 曾错误：热路径计算循环变量名用 Idx，与外层 tile 循环变量同名 → shadowing
+      //   正确：改为 dotIdx，与外层 dotIdx 区分（实际外层已用 dotIdx，内层也应用不同名）
+      for (uint rowGroupIdx {}; rowGroupIdx < smemNum; ++rowGroupIdx) {
+        As[(innerRowGroupAs + rowGroupIdx * strideA) * BK + innerColAs] = ((InitRow + innerRowGroupAs + rowGroupIdx * strideA) < M && recycle * BK + innerColAs < K)? A[(InitRow + innerRowGroupAs + rowGroupIdx * strideA) * K + recycle * BK + innerColAs]:0.0f;
+        Bs[(innerRowGroupBs + rowGroupIdx * strideB) * BN + innerColBs] = ((innerRowGroupBs + rowGroupIdx * strideB + recycle * BK) < K &&   (InitCol + innerColBs) < N)? B[(innerRowGroupBs + rowGroupIdx * strideB + recycle * BK) * N  + InitCol + innerColBs]:0.0f;
+      }
+      // 等待所有线程写入SMEM完毕
+      __syncthreads();
+
+      for (uint dotIdx {}; dotIdx < BK; ++dotIdx) {
+        float rowTemp[TM];
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          rowTemp[rowIdx] = As[(threadRowGroup * TM +rowIdx) * BK  + dotIdx];
+        }
+
+        float colTemp[TN];
+        for (uint colIdx {}; colIdx < TN; ++colIdx) {
+          colTemp[colIdx] = Bs[dotIdx * BN + threadColGroup * TN + colIdx];
+        }
+
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          for (uint colIdx {}; colIdx < TN; ++colIdx) {
+
+            treadResultArr[rowIdx * TN + colIdx] += rowTemp[rowIdx] * colTemp[colIdx];
+          }
+        }
+      }
+
+      __syncthreads();
+
+    }
+
+
+
+    for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+      for (uint colIdx {}; colIdx < TN; ++colIdx) {
+        if ((InitRow + threadRowGroup * TM + rowIdx) < M &&  InitCol + threadColGroup * TN + colIdx < N) {
+          C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx] = alpha * treadResultArr[rowIdx * TN + colIdx] + beta * C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx];
+        }
+      }
+    }
+  }
+  // 不是M\N方向的边界
+  else {
+    for (uint dotIdx = 0; dotIdx < recycle; ++dotIdx) {
+      for (uint rowGroupIdx {}; rowGroupIdx < smemNum; ++rowGroupIdx) {
+        As[(innerRowGroupAs + rowGroupIdx * strideA) * BK + innerColAs] =  A[(InitRow + innerRowGroupAs + rowGroupIdx * strideA) * K + dotIdx * BK + innerColAs];
+        Bs[(innerRowGroupBs + rowGroupIdx * strideB) * BN + innerColBs] =  B[(innerRowGroupBs + rowGroupIdx * strideB + dotIdx * BK) * N  + InitCol + innerColBs];
+      }
+      // 等待所有线程写入SMEM完毕
+      __syncthreads();
+
+      for (uint Idx {}; Idx < BK; ++Idx) {
+        float rowTemp[TM];
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          rowTemp[rowIdx] = As[(threadRowGroup * TM +rowIdx) * BK  + Idx];
+        }
+
+        float colTemp[TN];
+        for (uint colIdx {}; colIdx < TN; ++colIdx) {
+          colTemp[colIdx] = Bs[Idx * BN + threadColGroup * TN + colIdx];
+        }
+
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          for (uint colIdx {}; colIdx < TN; ++colIdx) {
+
+            treadResultArr[rowIdx * TN + colIdx] += rowTemp[rowIdx] * colTemp[colIdx];
+          }
+        }
+      }
+
+      __syncthreads();
+    }
+
+
+    if (remain_k > 0) {
+      // 曾错误写成（边界条件缺少 * BK）：
+      //   As 条件：recycle + innerColAs < K
+      //     错误：recycle 是 tile 数量，不是元素偏移；元素偏移 = recycle * BK
+      //     正确：recycle * BK + innerColAs < K
+      //   Bs 条件：innerRowGroupBs + rowGroupIdx * strideB + recycle < K
+      //     同理，错误：recycle 应为 recycle * BK
+      //     正确：innerRowGroupBs + rowGroupIdx * strideB + recycle * BK < K
+      //   地址计算（recycle * BK）两处都写对了，只有条件判断漏了 * BK
+      //
+      // 曾错误：热路径计算循环变量名用 Idx，与外层 tile 循环变量同名 → shadowing
+      //   正确：改为 dotIdx，与外层 dotIdx 区分（实际外层已用 dotIdx，内层也应用不同名）
+      for (uint rowGroupIdx {}; rowGroupIdx < smemNum; ++rowGroupIdx) {
+        As[(innerRowGroupAs + rowGroupIdx * strideA) * BK + innerColAs] = (recycle * BK + innerColAs < K)? A[(InitRow + innerRowGroupAs + rowGroupIdx * strideA) * K + recycle * BK + innerColAs]:0.0f;
+        Bs[(innerRowGroupBs + rowGroupIdx * strideB) * BN + innerColBs] = ((innerRowGroupBs + rowGroupIdx * strideB + recycle * BK) < K) ? B[(innerRowGroupBs + rowGroupIdx * strideB + recycle * BK) * N  + InitCol + innerColBs]:0.0f;
+      }
+      // 等待所有线程写入SMEM完毕
+      __syncthreads();
+
+      for (uint dotIdx {}; dotIdx < BK; ++dotIdx) {
+        float rowTemp[TM];
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          rowTemp[rowIdx] = As[(threadRowGroup * TM +rowIdx) * BK  + dotIdx];
+        }
+
+        float colTemp[TN];
+        for (uint colIdx {}; colIdx < TN; ++colIdx) {
+          colTemp[colIdx] = Bs[dotIdx * BN + threadColGroup * TN + colIdx];
+        }
+
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          for (uint colIdx {}; colIdx < TN; ++colIdx) {
+
+            treadResultArr[rowIdx * TN + colIdx] += rowTemp[rowIdx] * colTemp[colIdx];
+          }
+        }
+      }
+
+      __syncthreads();
+
+    }
+
+
+
+    for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+      for (uint colIdx {}; colIdx < TN; ++colIdx) {
+        C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx] = alpha * treadResultArr[rowIdx * TN + colIdx] + beta * C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx];
+      }
+    }
+  }
 }

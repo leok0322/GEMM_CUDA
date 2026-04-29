@@ -386,6 +386,17 @@ __global__ void gemm1DBlocktiling_v2(int M, int N, int K, float alpha,
       float tmpCol {Bs[colIdx * BN +threadCol]};
       // 固定列的情况下，循环行
       for (int rowIdx {}; rowIdx < TM; ++rowIdx) {
+        // ── 行号连续 vs 内存地址连续 ──────────────────────────────────────────
+        // 行号：threadRowGroup*TM+0, threadRowGroup*TM+1, ..., threadRowGroup*TM+TM-1
+        //       每次递增 1，是连续行，不跳跃 ✓
+        //
+        // 内存地址：As[(threadRowGroup*TM+rowIdx)*BK + colIdx]
+        //   相邻 rowIdx 的地址差 = BK×4 字节（As 按行主序，每行 BK 个 float）
+        //   行号连续，但内存地址以 BK 为步长跳跃，非字节连续
+        //
+        // 对比加载 As 阶段（地址化简为 threadIdx.x + rowIdx*blockDim.x）：
+        //   加载时不同线程覆盖不同列 → 地址连续
+        //   计算时同一线程遍历同一列的多行 → 行号连续，地址有步长
         //一个WARP读取AS的同一个元素，广播
         // 每个线程计算TM个行元素
         threadResults[rowIdx] += As[(threadRowGroup * TM + rowIdx)* BK + colIdx] * tmpCol;

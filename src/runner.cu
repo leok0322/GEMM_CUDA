@@ -400,6 +400,14 @@ void run_gemm_shared_mem_block(int M, int N, int K, float alpha, float *A,
   cudaCheck(cudaFuncGetAttributes(&funcAttributes, reinterpret_cast<const void*>(gemm_shared_mem_block<32>)));
 
   if (record) {
+    // 相对路径，解析为：当前工作目录（CWD）/ benchmark_results / kernel_3_properties.txt
+    // CWD 由启动方式决定，与 CMakeLists.txt 无关：
+    //   CLion Run/Debug：CWD = Run Configuration 的 Working Directory（默认项目根目录）
+    //     → 文件写到 <项目根>/benchmark_results/kernel_3_properties.txt
+    //   命令行 ./build/gemm：CWD = 执行命令时 shell 所在目录
+    //     → 若在 build/ 下执行，则尝试写到 build/benchmark_results/（目录不存在则静默失败）
+    // CMakeLists.txt 只能通过 add_custom_command(WORKING_DIRECTORY) 或
+    // set_tests_properties(WORKING_DIRECTORY) 控制 CWD，对普通可执行文件的运行时 CWD 无控制
     std::string fileNme {"benchmark_results/kernel_3_properties.txt"};
     std::ofstream file;
     file.open(fileNme);
@@ -428,6 +436,22 @@ void run_gemm_shared_mem_block(int M, int N, int K, float alpha, float *A,
     file << deviceProp.sharedMemPerBlockOptin  / (1<<10);
     file << " KiB";
     file << "\n";
+    // ── 寄存器相关字段说明 ────────────────────────────────────────────────────
+    // deviceProp.regsPerBlock：
+    //   单个 block 最多可占用的寄存器数（架构软限制）
+    //   现代 GPU（sm_30+）上与 regsPerMultiprocessor 相同，即理论上单 block 可独占整个寄存器文件
+    //
+    // deviceProp.regsPerMultiprocessor：
+    //   SM 寄存器文件的物理总量（硬件固定）
+    //   该 SM 上所有驻留 block 共享这些寄存器，是 occupancy 计算的分子
+    //
+    // funcAttributes.numRegs（在下方 kernel properties 中输出）：
+    //   编译器（ptxas）为每线程实际分配的寄存器数，是编译后的实测值
+    //   → 每 block 寄存器消耗 = numRegs × blockDim.x
+    //   → 每 SM 最多驻留 block 数 = floor(regsPerMultiprocessor / (numRegs × blockDim.x))
+    //   例（kernel_3，BLOCKSIZE=32，blockDim=32×32=1024 线程）：
+    //     numRegs=36 → 每 block 寄存器 = 36 × 1024 = 36864
+    //     每 SM 最多驻留 = floor(65536 / 36864) = 1 个 block（寄存器是 occupancy 瓶颈）
     file << "deviceProp.regsPerBlock: ";
     file << deviceProp.regsPerBlock;
     file << "\n";
@@ -901,30 +925,122 @@ void rungemm1DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
   cudaCheck(cudaGetLastError());
 }
 
-void runSgemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
-                           float beta, float *C) {
+void rungemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
+                           float beta, float *C, int deviceIdx,bool& record) {
+  // ── BM/BN 的选择：Roofline 模型与算术强度 ──────────────────────────────
+  //
+  // GFLOPS = 总FLOPs / 运行时间，总FLOPs = 2*M*N*K 固定
+  // → GFLOPS 提高 ⟺ 运行时间缩短
+  //
+  // Roofline 模型将性能分为两种瓶颈：
+  //   实际GFLOPS = min(峰值算力, 内存带宽 × 算术强度)
+  //
+  //   GFLOPS
+  //     │  峰值算力（compute bound）─────────────────
+  //     │                            /
+  //     │                           /  斜率 = 内存带宽
+  //     │                          /
+  //     └─────────────────────────/──────────────── 算术强度
+  //                             ridge point = 峰值算力 / 内存带宽
+  //
+  //   算术强度 < ridge point → memory bound：提高算术强度 → GFLOPS 沿斜线上升 ✓
+  //   算术强度 > ridge point → compute bound：已到天花板，再提高也无效 ✗
+  //
+  // ── 算术强度随 BM/BN 的变化 ────────────────────────────────────────────
+  //
+  // 每个 K tile：
+  //   global memory 加载：BM*BK（A tile）+ BK*BN（B tile）个 float
+  //   计算量：2 * BM * BN * BK FLOPs
+  //   算术强度 = 2*BM*BN*BK / ((BM*BK + BK*BN) * 4 bytes)
+  //            = 2*BM*BN / ((BM + BN) * 4)
+  //            = BM*BN / ((BM + BN) * 2)   （BM=BN 时 = BM/4）
+  //
+  //   BM=BN=64  → 算术强度 = 64/4 = 16 FLOP/byte
+  //   BM=BN=128 → 算术强度 = 128/4 = 32 FLOP/byte  （翻倍）
+  //
+  //   直觉：加载 A tile 的一个元素，它被 BN 列 B 复用 BN 次；
+  //         BN 越大，每次 global memory 加载能做的乘加越多
+  //
+  // ── sm_86 上的数值（RTX 3090）────────────────────────────────────────
+  //
+  //   峰值算力 ≈ 35600 GFLOPS，HBM 带宽 ≈ 936 GB/s
+  //   ridge point ≈ 35600 / 936 ≈ 38 FLOP/byte
+  //
+  //   BM=BN=64  → 16 FLOP/byte < 38 → memory bound，时间由带宽决定
+  //   BM=BN=128 → 32 FLOP/byte < 38 → 仍 memory bound，但带宽需求减半
+  //     → 相同 FLOPs，内存等待时间减少 → 运行时间缩短 → GFLOPS 提高 ✓
+  //
+  // ── 为什么小矩阵（M<128 或 N<128）不用 BM=BN=128 ─────────────────────
+  //
+  //   若 M=64 且 BM=128：block 负责 128 行，但只有 64 行有效数据
+  //   → 下半部分线程全部越界，做零有效工作（本 kernel 无边界检查）
+  //   → 有效线程利用率 50%，浪费寄存器和 SMEM
+  //   → 改用 BM=BN=64，所有线程有效，无浪费
   const uint BK = 8;
   const uint TM = 8;
   const uint TN = 8;
   if (M >= 128 and N >= 128) {
     const uint BM = 128;
     const uint BN = 128;
+
+    if (record) {
+      cudaDeviceProp deviceProp {};
+      cudaCheck(cudaGetDeviceProperties_v2(&deviceProp, deviceIdx));
+
+      cudaFuncAttributes funcAttributes {};
+      // cudaFuncGetAttributes 不需要 <<<gridDim, blockDim>>>，原因：
+      // 查询的是编译期由 ptxas 静态分析后嵌入 .cubin 元数据的属性，与启动多少线程无关
+      //   numRegs       : 每线程寄存器数，ptxas 分析 kernel 代码静态确定，与 blockDim 无关
+      //   sharedSizeBytes: __shared__ 变量总大小，模板参数固定后编译期确定
+      //   localSizeBytes : 每线程 spill 大小，ptxas 静态分析确定
+      //
+      // <<<gridDim, blockDim>>> 只在真正启动 kernel 执行时才需要，cudaFuncGetAttributes
+      // 只是从已加载的 .cubin 元数据段中读取编译期嵌入的值，两者阶段不同：
+      //   编译期：ptxas 分析 kernel → 确定 numRegs 等 → 嵌入 .cubin
+      //   查询期：cudaFuncGetAttributes → 从 .cubin 元数据读出，仅需函数指针
+      //   启动期：kernel<<<gridDim, blockDim>>>() → 真正在 GPU 上执行
+      //
+      // blockDim 影响的是整个 block 的资源消耗（numRegs × blockDim.x），
+      // 这是调用方自己计算的，不是 kernel 本身的属性，故无需传入
+      cudaCheck(cudaFuncGetAttributes(&funcAttributes, reinterpret_cast<const void*>(gemm2DBlocktiling_v2<BM, BN, BK, TM, TN>)));
+
+      std::string fileNme {"benchmark_results/kernel_5_properties.txt"};
+      std::ofstream file;
+      file.open(fileNme);
+
+      file << "deviceProp.regsPerBlock: ";
+      file << deviceProp.regsPerBlock;
+      file << "\n";
+      file << "deviceProp.regsPerMultiprocessor: ";
+      file << deviceProp.regsPerMultiprocessor;
+      file << "\n\n";
+      file << "funcAttributes.numRegs: ";
+      file << funcAttributes.numRegs;
+      file << "\n\n";
+    }
+
+
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    // (BM*BN) % (TM*TN) == 0：确保 blockDim.x = (BM*BN)/(TM*TN) 是整数
+    // 若不整除，截断使 blockDim.x 偏小，部分输出元素无线程负责 → 结果错误
+    // 注：条件应写 % == 0，而非 / == 0（后者判断商是否为零，BM*BN>=TM*TN 时永远 false）
+    assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemm2DBlocktiling<BM, BN, BK, TM, TN>
+    gemm2DBlocktiling_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
-    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
     cudaCheck(cudaGetLastError());
   } else {
-    // this is a hacky solution to the underlying problem
-    // of not having proper bounds checking in the kernel
+    // M 或 N < 128：用 BM=BN=64 避免大量线程越界空转
     const uint BM = 64;
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    // 同上，确保 blockDim.x 是整数
+    assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemm2DBlocktiling<BM, BN, BK, TM, TN>
+    gemm2DBlocktiling_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
-    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
     cudaCheck(cudaGetLastError());
   }
 }
@@ -1267,7 +1383,7 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     rungemm1DBlocktiling(M, N, K, alpha, A, B, beta, C);
     break;
   case 5:
-    runSgemm2DBlocktiling(M, N, K, alpha, A, B, beta, C);
+    rungemm2DBlocktiling(M, N, K, alpha, A, B, beta, C,deviceIdx,record);
     break;
   case 6:
     runSgemmVectorize(M, N, K, alpha, A, B, beta, C);

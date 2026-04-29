@@ -1020,28 +1020,113 @@ void rungemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
     }
 
 
-    dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    // ── 方案 B：分多次 kernel 启动，通过普通参数传入 block 偏移量 ──────────────
+    // 问题背景：
+    //   矩阵尺寸 M、N 不一定是 BM、BN 的整数倍，边界 block 需要做越界判断。
+    //   最初想法：把 N/BN 作为 template 参数，让编译器区分内部/边界 block。
+    //   但 template 参数必须是编译期常量，而 N 是运行期参数 → 报错：
+    //     "Substitution failed: expression is not an integral constant expression"
+    //   因此改用 offsetCol / offsetRow 两个普通 kernel 参数（uint，运行期传入）。
+    //
+    // 方案 B 做法：把输出矩阵分成 4 块，分别启动 kernel：
+    //
+    //   ┌─────────────────┬─────────┐
+    //   │  内部块          │  右边缘 │  ← N % BN != 0 时才有
+    //   │  BOUNDARY=false │  BOUNDARY=true │
+    //   │  gridDim=(N/BN, M/BM)    │  gridDim=(1, M/BM) │
+    //   ├─────────────────┼─────────┤
+    //   │  下边缘          │  右下角 │  ← M % BM != 0 时才有
+    //   │  BOUNDARY=true  │  BOUNDARY=true │
+    //   │  gridDim=(N/BN, 1)       │  gridDim=(1,1)     │
+    //   └─────────────────┴─────────┘
+    //
+    // 每次启动时，blockIdx 都从 (0,0) 开始；
+    // kernel 内部用 (blockIdx.x + offsetCol)*BN、(blockIdx.y + offsetRow)*BM
+    // 把 block 映射到正确的输出位置。
+    //
+    // 具体示例（M=260, N=260, BM=BN=128）：
+    //   内部块：gridDim=(2,2), offsetCol=0, offsetRow=0  → 覆盖 [0..255]×[0..255]
+    //   右边缘：gridDim=(1,2), offsetCol=2, offsetRow=0  → 覆盖 [0..255]×[256..259]
+    //   下边缘：gridDim=(2,1), offsetCol=0, offsetRow=2  → 覆盖 [256..259]×[0..255]
+    //   右下角：gridDim=(1,1), offsetCol=2, offsetRow=2  → 覆盖 [256..259]×[256..259]
+    // ────────────────────────────────────────────────────────────────────────────
+    dim3 innerGridDim(N / BN,  M / BM);
     // (BM*BN) % (TM*TN) == 0：确保 blockDim.x = (BM*BN)/(TM*TN) 是整数
     // 若不整除，截断使 blockDim.x 偏小，部分输出元素无线程负责 → 结果错误
     // 注：条件应写 % == 0，而非 / == 0（后者判断商是否为零，BM*BN>=TM*TN 时永远 false）
     assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
-    gemm2DBlocktiling_v2<BM, BN, BK, TM, TN>
-        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,false>
+        <<<innerGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, 0, 0);
     // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
     cudaCheck(cudaGetLastError());
+
+    if (N % BN != 0) {
+      dim3 rightEdgeGridDim(1,  M / BM);
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+        <<<rightEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C,N/BN, 0);
+      // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
+      cudaCheck(cudaGetLastError());
+    }
+
+
+    if (M % BM != 0) {
+      dim3 leftEdgeGridDim(N/BN,  1);
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+        <<<leftEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, 0, M / BM);
+      // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
+      cudaCheck(cudaGetLastError());
+    }
+
+    // 右下角
+    if (N % BN != 0 && M % BM != 0) {
+      dim3 cornerEdgeGridDim(1, 1);
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+          <<<cornerEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, N/BN, M / BM);
+      // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
+      cudaCheck(cudaGetLastError());
+    }
+
+
+
   } else {
     // M 或 N < 128：用 BM=BN=64 避免大量线程越界空转
     const uint BM = 64;
     const uint BN = 64;
-    dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    dim3 innerGridDim(N / BN,  M/ BM);
     // 同上，确保 blockDim.x 是整数
     assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
-    gemm2DBlocktiling_v2<BM, BN, BK, TM, TN>
-        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,false>
+        <<<innerGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, 0, 0);
     // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
     cudaCheck(cudaGetLastError());
+
+    if (N % BN != 0) {
+      dim3 rightEdgeGridDim(1,  M / BM);
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+        <<<rightEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C,N/BN, 0);
+      // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
+      cudaCheck(cudaGetLastError());
+    }
+
+
+    if (M % BM != 0) {
+      dim3 leftEdgeGridDim(N/BN,  1);
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+        <<<leftEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, 0, M / BM);
+      // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
+      cudaCheck(cudaGetLastError());
+    }
+
+    // 右下角
+    if (N % BN != 0 && M % BM != 0) {
+      dim3 cornerEdgeGridDim(1, 1);
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+          <<<cornerEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, N/BN, M / BM);
+      // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
+      cudaCheck(cudaGetLastError());
+    }
   }
 }
 

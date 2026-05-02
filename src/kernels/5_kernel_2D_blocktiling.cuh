@@ -530,6 +530,27 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
     // 注：参数不同结果不同（BN=128 时 As=2-way, Bs=4-way；BN=64 时 As=4-way, Bs=2-way）
     //     两种情况 As 和 Bs 均存在 bank conflict，根本原因是 TM×BK 和 TN 与 32 的整除关系
     //     kernel_7（resolve_bank_conflicts）通过 SMEM padding 或转置解决此问题
+    //
+    // ── BN=128 时的 bank conflict 补充分析 ──────────────────────────────────────
+    // BN/TN = 128/8 = 16，warp 内 threadColGroup ∈ {0..15}，每值 2 线程广播
+    //
+    // As 读取（2-way）：
+    //   warp 内 threadRowGroup ∈ {0, 1}（256线程/block，16个col组，32/16=2个row组）
+    //   r=0: bank = (rowIdx*8+Idx) % 32
+    //   r=1: bank = (64+rowIdx*8+Idx) % 32 = 同上（64%32=0）
+    //   → 2-way bank conflict
+    //
+    // Bs 读取（4-way）：
+    //   Bs[Idx*128 + threadColGroup*8 + colIdx]，BN=128，128%32=0
+    //   threadColGroup=j 的 bank = (j*8+colIdx) % 32
+    //     j=0 → colIdx    j=4 → colIdx    j=8  → colIdx    j=12 → colIdx  ← 4 路冲突
+    //     j=1 → 8+colIdx  j=5 → 8+colIdx  j=9  → 8+colIdx  j=13 → 8+colIdx
+    //     j=2 → 16+colIdx j=6 → 16+colIdx j=10 → 16+colIdx j=14 → 16+colIdx
+    //     j=3 → 24+colIdx j=7 → 24+colIdx j=11 → 24+colIdx j=15 → 24+colIdx
+    //   → 4-way bank conflict
+    //
+    // kernel_6 仅对 As 做了转置（消除 As 的 conflict），Bs 的 conflict 仍存在
+    // → kernel_7 继续解决 Bs 的 bank conflict
     // ────────────────────────────────────────────────────────────────────────────
     for (uint Idx {}; Idx < BK; ++Idx) {
       float rowTemp[TM];
@@ -733,6 +754,9 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   float treadResultArr[TM * TN] = {0.0};
   // 不检查边界的循环次数
   const uint recycle = K / BK;
+  // 主循环每次消耗 BK 列，共跑 recycle 次；K 不整除 BK 时还剩 remain_k 列需单独处理
+  // remain_k > 0：额外再跑一次，只写入 remain_k 列（< BK），越界部分填 0
+  // remain_k = 0：K 恰好整除 BK，主循环已覆盖全部，不需要额外处理
   const uint remain_k = K % BK;
 
   // ── if constexpr (BOUNDARY) 的作用 ──────────────────────────────────────────

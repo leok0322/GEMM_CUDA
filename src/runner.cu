@@ -1138,9 +1138,11 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
   if (M >= 128 and N >= 128) {
     const uint BM = 128;
     const uint BN = 128;
+    //保证线程数是整数
+    static_assert((BM * BN) % (  TM * TN ) == 0, "线程数不是整数");
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize<BM, BN, BK, TM, TN>
+    gemmVectorize_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
     // this is a hacky solution to the underlying problem
@@ -1149,7 +1151,7 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize<BM, BN, BK, TM, TN>
+    gemmVectorize_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
     // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
     cudaCheck(cudaGetLastError());

@@ -20,7 +20,7 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p "$ERROR_LOG_DIR"
 
 # seq 0 12：生成 0 1 2 ... 12 的序列，for 循环依次赋值给 i
-for i in $(seq 5 5); do
+for i in $(seq 6 6); do
     echo "Running kernel $i ..."
     # DEVICE=0        ：shell 内联环境变量语法，仅对紧跟的这条命令生效，不影响后续命令
     #                   等价于 export DEVICE=0 + 执行 + unset DEVICE，但更简洁

@@ -142,7 +142,7 @@
 //     方法：
 //       a. 消除 SMEM bank conflict（FMA 不再等 SMEM 串行化）
 //       b. 数据加载到寄存器复用（regM/regN，SMEM 访问次数大幅减少，FMA 等待减少）
-//       c. 减少 load/循环指令数，缩短加载阶段（float4 的收益）
+//       c. 减少 load 指令数，缩短加载阶段（float4 的收益）
 //
 //   两条路径的最终目标都是让 FMA 更满，途径不同：
 //     路径①：让 kernel 进入 compute-bound 区（AI 够高，内存不再是瓶颈）
@@ -156,6 +156,44 @@
 //   │ 寄存器复用   │ SMEM 访问减少        │ ②           │ FMA 空转 ↓   │
 //   │ 消除bankconf │ FMA 等待减少         │ ②           │ FMA 空转 ↓   │
 //   └──────────────┴──────────────────────┴──────────────┴──────────────┘
+//
+// ── 路径②的两种子机制：latency 隐藏 vs throughput ──────────────────────────
+//
+//   路径②内部有两类截然不同的机制，compute-bound 时敏感度不同：
+//
+//   【机制A】bank conflict → latency 问题 → 可被 warp 切换隐藏
+//
+//     bank conflict 让当前 warp stall，调度器切换到其他 ready warp，
+//     FMA 单元继续跑其他 warp 的计算，conflict 延迟被掩盖。
+//     compute-bound 时 ready warp 充足，调度器从不缺活 → conflict 影响有限。
+//
+//   【机制B】加载阶段指令数 → throughput 问题 → 无法隐藏
+//
+//     加载阶段和计算阶段被 __syncthreads__ 严格隔开，不重叠：
+//
+//       加载阶段：GMEM→SMEM（load/store 指令在此）
+//       __syncthreads()    ← 全 block 等齐后才放行
+//       计算阶段：SMEM→寄存器→FMA
+//
+//     store 指令只在加载阶段执行，FMA 只在计算阶段执行，
+//     两者不同时竞争发射槽，所以问题不是"store 抢了 FMA 的发射槽"。
+//
+//     真正的损失：加载阶段指令多 → 加载阶段耗时长 → sync 屏障推迟 → FMA 等待：
+//
+//       指令少：[──加载──]──sync──[────FMA────]
+//       指令多：[────加载────]──sync──[────FMA────]
+//                    ↑ 这段时间 FMA 等待（SM 上有其他 block 可部分填补，但本 block 吞吐下降）
+//
+//     每条指令都必须执行，无法跳过 → 加载阶段时间是硬性下限。
+//
+//   compute-bound 时两种机制的对比：
+//     机制A（conflict）：warp 切换可隐藏延迟 → 影响较小
+//     机制B（指令数） ：sync 推迟，FMA 等待 → 影响更直接
+//
+//   实例（kernel_6 vs kernel_7）：
+//     kernel_7 把 Bs 写入从 1 条 float4 store 改为 4 条 scalar store，
+//     消除了读 conflict（机制A收益），但增加了加载阶段指令数（机制B损失），
+//     净效果：机制B损失 > 机制A收益 → 4377 GFLOPS < kernel_6 的 4699 GFLOPS
 //
 // ── FMA 与 compute-bound 的关系 ──────────────────────────────────────────────
 //
@@ -675,7 +713,13 @@ gemmVectorize_v2(int M, int N, int K, float alpha, float *A,
         colVecAs.z = 0.0f;
         colVecAs.w = 0.0f;
       }
-      //将A的转置写入As
+      //将A写入As，行主序
+      // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4] = colVecAs.x;
+      // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4 + 1] = colVecAs.y;
+      // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4 + 2] = colVecAs.z;
+      // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4 + 3] = colVecAs.w;
+
+      //将A的转置写入As，列主序
       As[(innerColGroupAs * 4) * BM + (innerRowAs + rowIdx)] = colVecAs.x;
       As[(innerColGroupAs * 4 + 1) * BM + (innerRowAs + rowIdx)] = colVecAs.y;
       As[(innerColGroupAs * 4 + 2) * BM + (innerRowAs + rowIdx)] = colVecAs.z;
@@ -798,8 +842,8 @@ gemmVectorize_v2(int M, int N, int K, float alpha, float *A,
       for (uint colNumIdx{}; colNumIdx < TN; ++colNumIdx) {
         // 读取BS
         // 一个轮次，colIdx、colNumIdx不变，threadColGroop变化
-        // 一个warp32个线程，BN / TN= 128 / 8 =16，threadColGroop列组是0，1，2，3，...，15，threadRowGroup行组是0，0，0，0...，1，1，1，1
-        // 每个线程相差8个元素，2个线程访问同一个元素，共访问16个元素， 16 / 4 = 4-way conflict
+        // 一个warp32个线程，BN / TN= 128 / 8 =16，threadColGroop列组是0，1，2，3，...，15，0，1，2，3，...，15，threadRowGroup行组是0，0，0，0...，1，1，1，1
+        // 每个线程相差8个元素，一行访问4个bank，2个线程访问同一个元素，只需要看前16个线程， 16 / 4 = 4-way conflict
         tmpBs[colNumIdx] = Bs[colIdx * BN + threadColGroop  * TN + colNumIdx];
       }
 

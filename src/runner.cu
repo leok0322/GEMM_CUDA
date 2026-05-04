@@ -1130,7 +1130,7 @@ void rungemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
   }
 }
 
-void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
+void rungemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
                        float beta, float *C) {
   const uint BK = 8;
   const uint TM = 8;
@@ -1144,6 +1144,8 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     dim3 blockDim((BM * BN) / (TM * TN));
     gemmVectorize_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    cudaCheck(cudaGetLastError());
   } else {
     // this is a hacky solution to the underlying problem
     // of not having proper bounds checking in the kernel
@@ -1158,7 +1160,7 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
   }
 }
 
-void runSgemmResolveBankConflicts(int M, int N, int K, float alpha, float *A,
+void rungemmResolveBankConflicts(int M, int N, int K, float alpha, float *A,
                                   float *B, float beta, float *C) {
   const uint BK = 8;
   const uint TM = 8;
@@ -1167,17 +1169,21 @@ void runSgemmResolveBankConflicts(int M, int N, int K, float alpha, float *A,
     const uint BM = 128;
     const uint BN = 128;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    static_assert((BM * BN) % (TM * TN) == 0 && "线程数不是整数");
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankConflicts<BM, BN, BK, TM, TN>
+    gemmResolveBankConflicts_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    cudaCheck(cudaGetLastError());
   } else {
     // this is a hacky solution to the underlying problem
     // of not having proper bounds checking in the kernel
     const uint BM = 64;
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    static_assert((BM * BN) % (TM * TN) == 0 && "线程数不是整数");
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankConflicts<BM, BN, BK, TM, TN>
+    gemmResolveBankConflicts_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
     // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
     cudaCheck(cudaGetLastError());
@@ -1473,10 +1479,10 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     rungemm2DBlocktiling(M, N, K, alpha, A, B, beta, C,deviceIdx,record);
     break;
   case 6:
-    runSgemmVectorize(M, N, K, alpha, A, B, beta, C);
+    rungemmVectorize(M, N, K, alpha, A, B, beta, C);
     break;
   case 7:
-    runSgemmResolveBankConflicts(M, N, K, alpha, A, B, beta, C);
+    rungemmResolveBankConflicts(M, N, K, alpha, A, B, beta, C);
     break;
   case 8:
     runSgemmResolveBankExtraCol(M, N, K, alpha, A, B, beta, C);

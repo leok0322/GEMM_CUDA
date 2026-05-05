@@ -157,43 +157,81 @@
 //   │ 消除bankconf │ FMA 等待减少         │ ②           │ FMA 空转 ↓   │
 //   └──────────────┴──────────────────────┴──────────────┴──────────────┘
 //
-// ── 路径②的两种子机制：latency 隐藏 vs throughput ──────────────────────────
+// ── 路径②的深层分析：加载阶段 vs 计算阶段的 bank conflict 代价不对称 ────────
 //
-//   路径②内部有两类截然不同的机制，compute-bound 时敏感度不同：
+//   两个阶段都有 __syncthreads__ 作为屏障，conflict 都会推迟各自的 sync。
+//   但 compute-bound 时，两个阶段的 conflict 实际代价严重不对称：
 //
-//   【机制A】bank conflict → latency 问题 → 可被 warp 切换隐藏
+//   【计算阶段读 conflict】实际代价 ≈ 0（被 FMA 工作掩盖）
 //
-//     bank conflict 让当前 warp stall，调度器切换到其他 ready warp，
-//     FMA 单元继续跑其他 warp 的计算，conflict 延迟被掩盖。
-//     compute-bound 时 ready warp 充足，调度器从不缺活 → conflict 影响有限。
+//     计算循环结构（BK=8 次迭代，每次迭代内无屏障）：
+//       for dotIdx = 0..BK-1:
+//           SMEM read Bs（可能 4-way conflict → stall 3 周期）
+//           FMA
+//       __syncthreads()
 //
-//   【机制B】加载阶段指令数 → throughput 问题 → 无法隐藏
+//     conflict stall 发生时，调度器切换到其他 warp 继续做 FMA：
+//       warp A：[SMEM read + stall 3cy][FMA][SMEM read + stall]...
+//       warp B：              [FMA]    [SMEM read][FMA]...
+//       FMA 单元几乎不空转，conflict 的周期损失被其他 warp 的 FMA 填满
 //
-//     加载阶段和计算阶段被 __syncthreads__ 严格隔开，不重叠：
+//     conflict 延迟分散在 BK=8 次迭代中，每次 stall 后紧跟 FMA，
+//     到达 sync 时，大部分延迟已被掩盖 → sync 推迟量远小于理论值
+//     compute-bound 时 ready warp 充足 → 实际代价接近 0
 //
-//       加载阶段：GMEM→SMEM（load/store 指令在此）
-//       __syncthreads()    ← 全 block 等齐后才放行
-//       计算阶段：SMEM→寄存器→FMA
+//   【加载阶段写 conflict 或多余指令】实际代价 ≈ 理论值（无处掩盖）
 //
-//     store 指令只在加载阶段执行，FMA 只在计算阶段执行，
-//     两者不同时竞争发射槽，所以问题不是"store 抢了 FMA 的发射槽"。
+//     加载阶段结构（单次，无循环）：
+//       GMEM read（所有 warp 等待数据）
+//       SMEM write（write conflict 或多余指令在此）
+//       __syncthreads()    ← sync 紧随其后，无后续 FMA 可填补
 //
-//     真正的损失：加载阶段指令多 → 加载阶段耗时长 → sync 屏障推迟 → FMA 等待：
+//     所有 warp 做的是同样的事（GMEM→SMEM），没有"正在做 FMA 的 warp"来填补 stall。
+//     write 的额外代价直接暴露在 sync 前，sync 推迟 → 计算阶段延迟启动 → FMA 空转。
 //
-//       指令少：[──加载──]──sync──[────FMA────]
-//       指令多：[────加载────]──sync──[────FMA────]
-//                    ↑ 这段时间 FMA 等待（SM 上有其他 block 可部分填补，但本 block 吞吐下降）
+//   ┌──────────────────┬──────────────────────┬──────────────────┐
+//   │                  │ 计算阶段读 conflict  │ 加载阶段写开销   │
+//   ├──────────────────┼──────────────────────┼──────────────────┤
+//   │ 理论代价         │ 大（4-way × BK次）   │ 小（1次）        │
+//   │ 实际代价         │ ≈ 0（FMA 掩盖）      │ ≈ 理论值         │
+//   │ sync 推迟量      │ 小                   │ 大               │
+//   │ FMA 影响         │ 几乎无               │ 直接空转         │
+//   └──────────────────┴──────────────────────┴──────────────────┘
 //
-//     每条指令都必须执行，无法跳过 → 加载阶段时间是硬性下限。
+//   结论：compute-bound 时，计算阶段的 conflict 几乎免费，消除它收益极小；
+//         加载阶段引入 conflict 或多余指令代价是真实的，影响远大于前者。
 //
-//   compute-bound 时两种机制的对比：
-//     机制A（conflict）：warp 切换可隐藏延迟 → 影响较小
-//     机制B（指令数） ：sync 推迟，FMA 等待 → 影响更直接
+// ── STS.128 的 phase 机制：float4 写入为何 conflict-free ──────────────────────
 //
-//   实例（kernel_6 vs kernel_7）：
-//     kernel_7 把 Bs 写入从 1 条 float4 store 改为 4 条 scalar store，
-//     消除了读 conflict（机制A收益），但增加了加载阶段指令数（机制B损失），
-//     净效果：机制B损失 > 机制A收益 → 4377 GFLOPS < kernel_6 的 4699 GFLOPS
+//   kernel_6 Bs 写入使用 float4 向量 store：
+//     reinterpret_cast<float4*>(&Bs[innerRowB * BN + innerColB * 4])[0] = tmp
+//   编译器生成 STS.128（128-bit SMEM store），硬件分 4 个 phase 执行：
+//
+//     Phase 0：thread  0- 7 → float  0-31 → bank  0-31（各 1 次）→ 无冲突
+//     Phase 1：thread  8-15 → float 32-63 → bank  0-31（各 1 次）→ 无冲突
+//     Phase 2：thread 16-23 → float 64-95 → bank  0-31（各 1 次）→ 无冲突
+//     Phase 3：thread 24-31 → float 96-127→ bank  0-31（各 1 次）→ 无冲突
+//
+//   每个 phase 的 8 线程 × 4 float = 32 个元素，恰好覆盖全部 32 个 bank 各一次，
+//   4 个 phase 顺序执行 → 整体 0 conflict。
+//
+//   4 条 STS.32（scatter 写入，步长=16）：无法分 phase，32 线程同时发射，
+//     同 bank 的不同线程产生真实 conflict，且指令数从 1 增加到 4。
+//
+// ── 实例：kernel_7 vs kernel_6 ─────────────────────────────────────────────────
+//
+//   kernel_7 用 4 条 scatter STS.32 替换 1 条 STS.128，目的是消除 Bs 读 conflict：
+//
+//   ┌──────────────┬──────────────────────┬──────────────────────┬──────────────┐
+//   │              │ Bs 写入              │ Bs 读 conflict       │ 实测         │
+//   ├──────────────┼──────────────────────┼──────────────────────┼──────────────┤
+//   │ kernel_6     │ STS.128，phase → 0   │ 4-way（实际代价≈0）  │ 4699 GFLOPS  │
+//   │ kernel_7     │ 4×STS.32，新引入     │ 无                   │ 4377 GFLOPS  │
+//   │              │ conflict + 4 条指令  │                      │              │
+//   └──────────────┴──────────────────────┴──────────────────────┴──────────────┘
+//
+//   消除了"实际代价≈0"的读 conflict（收益≈0），
+//   引入了真实代价的写 conflict + 额外指令（损失为正）→ 净效果为负
 //
 // ── FMA 与 compute-bound 的关系 ──────────────────────────────────────────────
 //
@@ -735,6 +773,18 @@ gemmVectorize_v2(int M, int N, int K, float alpha, float *A,
       // 写入Bs的时候：
       //   线程0写（0，0），线程1写（0，4），...
       //   那么，间隔4个元素，，每 8 个线程 bank 重复，所以4-way bank conflict
+      // 实际Bs 写入 bank conflict 分析：
+      //   线程 t（warp 0，innerRowB=0）写入 Bs[t*4 .. t*4+3]（步长=4 个 float）
+      //   若按标量分析：thread 0→bank 0，thread 8→bank 0（32=8×4）→ 4-way conflict
+      //
+      //   但此处写入是 float4 向量 store → 编译器生成 STS.128（128-bit SMEM store）
+      //   STS.128 由硬件分 4 个 phase 执行，每 phase 8 个线程：
+      //     Phase 0：thread  0-7  → float  0-31 → bank 0-31（各 1 次）→ 无冲突
+      //     Phase 1：thread  8-15 → float 32-63 → bank 0-31（各 1 次）→ 无冲突
+      //     Phase 2：thread 16-23 → float 64-95 → bank 0-31（各 1 次）→ 无冲突
+      //     Phase 3：thread 24-31 → float 96-127→ bank 0-31（各 1 次）→ 无冲突
+      //   每 phase 8 线程 × 4 float = 32 个元素，恰好覆盖全部 32 bank 各一次 → 实际 0 conflict
+
       float4 colVecBs;
       if ((innerRowBs + outterIdx + rowIdx) < K  && (innerColGroupBs * 4 + initCol) + 3 < N) {
         colVecBs = reinterpret_cast<float4 *>(&B[(innerRowBs + outterIdx + rowIdx) * N + innerColGroupBs * 4 + initCol])[0];

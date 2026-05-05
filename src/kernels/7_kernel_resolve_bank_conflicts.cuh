@@ -44,63 +44,75 @@
 //
 // ── 为何 kernel_7 实测反而比 kernel_6 慢（4377 vs 4699 GFLOPS）────────────
 //
-//   表面看消除了 Bs 读 conflict 应该更快，但两个因素导致性能下降：
+//   直觉：消除了 Bs 读 conflict → 应该更快
+//   实测：反而更慢。原因在于对两个阶段代价的错误估计。
 //
-//   ① Bs 写入：1 条向量指令 → 4 条标量指令（throughput 问题，无法隐藏）
+//   ① 【修正】kernel_6 Bs 写入实际是 0 conflict（不是 4-way）
 //
-//     kernel_6 写入：reinterpret_cast<float4*>(...)[0] = tmp
-//       4 个 float 写到连续地址 → 编译器生成 1 条 st.shared.v4.f32
+//     kernel_6 写入：reinterpret_cast<float4*>(&Bs[...])[0] = tmp
+//       4 个 float 写到连续地址 → 编译器生成 STS.128（128-bit 向量 store 指令）
+//       STS.128 由硬件分 4 个 phase 执行，每 phase 8 个线程 × 4 float：
+//         Phase 0：thread  0-7  → float  0-31  → bank 0-31（各 1 次）→ 0 conflict
+//         Phase 1：thread  8-15 → float 32-63  → bank 0-31（各 1 次）→ 0 conflict
+//         Phase 2：thread 16-23 → float 64-95  → bank 0-31（各 1 次）→ 0 conflict
+//         Phase 3：thread 24-31 → float 96-127 → bank 0-31（各 1 次）→ 0 conflict
+//       每 phase 8 线程 × 4 float = 32 个元素，恰好覆盖全部 32 bank 各一次
+//       → kernel_6 Bs 写入 = 0 bank conflict
 //
-//     kernel_7 写入：4 条独立 scalar store，目标地址步长=16（非连续）
-//       编译器无法生成向量指令 → 4 条 st.shared.f32，指令数增加 4 倍
+//     这是关键前提：kernel_7 的"优化"起点并非 4-way 写 conflict，而是 0 conflict
 //
-//   ② 指令数增加的性能损失机制：加载阶段变长，FMA 等待 syncthreads（不是争抢发射槽）
+//   ② kernel_7 Bs 写入：从 0 冲突 → 引入新冲突 + 指令数 ×4
 //
-//     常见误解：store 指令多了，占用了本该给 FMA 的发射槽
-//     实际原因：加载阶段和计算阶段被 __syncthreads__ 严格隔开，不重叠：
+//     kernel_7 写入：4 条独立 scalar store，目标地址步长 = BN/TN = 16（非连续）
+//       编译器无法合并为向量指令 → 4 条 STS.32，且：
+//       - 2-way bank conflict（步长 16，每 2 个线程落同一 bank）
+//       - 指令数从 1 增加到 4，加载阶段耗时延长
 //
-//       加载阶段：GMEM→SMEM（store 指令在此执行）
-//       __syncthreads()    ← 全 block 等齐后才能继续
-//       计算阶段：SMEM→寄存器→FMA（FMA 指令在此执行）
+//     净写入变化：0 conflict，1 条指令 → 2-way conflict，4 条指令（双重劣化）
 //
-//     store 指令只在加载阶段，FMA 只在计算阶段，两者根本不同时竞争发射槽
+//   ③ 读 conflict 消除的实际收益接近 0（在 compute-bound 下）
 //
-//     真正的机制：4条 scalar store > 1条 vector store → 加载阶段耗时增加
-//       → __syncthreads 屏障更晚解除 → 计算阶段推迟启动 → FMA 等待
+//     kernel_6 计算阶段读 Bs 有 4-way conflict，但：
+//       计算阶段有 BK=8 次外层循环，每次内层有 TM×TN=64 次 FMA
+//       某 warp 读 conflict → stall → 调度器切换到其他 warp 执行 FMA
+//       FMA 单元持续工作，conflict 延迟被完全掩盖
+//       → compute-bound 时，读 conflict 的实际代价 ≈ 0
 //
-//       kernel_6：[──加载──]──sync──[────FMA────]
-//       kernel_7：[────加载────]──sync──[────FMA────]
-//                      ↑ 多出这段时间内 FMA 等待
+//     kernel_7 消除读 conflict，但消除的是一个代价已近乎为零的问题
+//     → 读 conflict 消除的收益 ≈ 0
 //
-//     SM 上有其他 block 时可部分缓解（其他 block 的 warp 在跑 FMA），
-//     但本 block 的计算时间占比下降，整体吞吐仍降低
+//   ④ 加载阶段 vs 计算阶段的代价不对称
 //
-//   ③ Bank conflict 是 latency 问题（可被隐藏），指令数是 throughput 问题（不可隐藏）
+//     计算阶段 conflict（kernel_6 读 conflict）：
+//       被 __syncthreads__ 后面大量 FMA 工作掩盖 → 代价 ≈ 0
 //
-//     Bank conflict 的隐藏机制：
-//       某 warp 遇到 bank conflict → stall → 调度器切换到其他 ready warp
-//       FMA 单元继续执行其他 warp → bank conflict 延迟被掩盖
-//       compute-bound 时有大量 ready warp → 调度器从不缺活 → conflict 影响极小
+//     加载阶段 conflict / 指令增加（kernel_7 写 conflict + 4×指令）：
+//       加载阶段结束后立刻是 __syncthreads__，全 block 等齐后才开始 FMA
+//       加载阶段内无 FMA 可填充 stall → conflict 代价完全暴露
 //
-//     指令数增加无法隐藏：
-//       每条 store 指令延长加载阶段，sync 屏障推迟，FMA 启动推迟
-//       这是硬性时序开销，无论调度器多优秀都无法绕过
+//       kernel_6：[──加载（0 conflict）──]──sync──[────FMA（4-way 读 conflict≈0）────]
+//       kernel_7：[────加载（2-way + ×4指令）────]──sync──[────FMA（0 读 conflict）────]
+//                      ↑ 这段额外时间 FMA 完全等待，无法隐藏
 //
-//   ④ 结论：
-//     读 conflict（4-way）：latency 类型，compute-bound 时被 warp 切换掩盖，影响有限
-//     写指令数（×4）      ：延长加载阶段，FMA 等待 sync，无法掩盖
-//     净效果：加载阶段开销 > 读 conflict 消除收益 → kernel_7 略慢
+//   ⑤ 结论：
+//     kernel_6 Bs 写入：STS.128 → phase → 0 conflict，1 条指令（加载阶段代价低）
+//     kernel_7 Bs 写入：4×STS.32 → 2-way conflict，4 条指令（加载阶段代价高）
+//     kernel_6 Bs 读取：4-way conflict，但 FMA 掩盖，实际代价 ≈ 0
+//     kernel_7 Bs 读取：0 conflict，但收益 ≈ 0（消除了一个几乎免费的代价）
+//     净效果：写入劣化（硬代价） > 读取优化（≈0 收益） → kernel_7 反而慢
 //
-//   ┌──────────────┬─────────────────────┬──────────────────────┬──────────────┐
-//   │              │ Bs 写入             │ Bs 读 conflict       │ 实测         │
-//   ├──────────────┼─────────────────────┼──────────────────────┼──────────────┤
-//   │ kernel_6     │ 1条 v4 store，4-way │ 4-way（每 dotIdx）   │ 4699 GFLOPS  │
-//   │ kernel_7     │ 4条 scalar store，  │ 无                   │ 4377 GFLOPS  │
-//   │              │ 2-way               │                      │              │
-//   └──────────────┴─────────────────────┴──────────────────────┴──────────────┘
+//   ┌──────────────┬──────────────────────────────┬──────────────────────┬──────────────┐
+//   │              │ Bs 写入（加载阶段）          │ Bs 读（计算阶段）    │ 实测         │
+//   ├──────────────┼──────────────────────────────┼──────────────────────┼──────────────┤
+//   │ kernel_6     │ STS.128，phase→0 conflict    │ 4-way（FMA掩盖≈0）  │ 4699 GFLOPS  │
+//   │              │ 1 条指令                     │                      │              │
+//   ├──────────────┼──────────────────────────────┼──────────────────────┼──────────────┤
+//   │ kernel_7     │ 4条 STS.32，2-way conflict   │ 无                   │ 4377 GFLOPS  │
+//   │              │ 4 条指令（4×）               │ （收益≈0）           │              │
+//   └──────────────┴──────────────────────────────┴──────────────────────┴──────────────┘
 //
 //   正确消除 Bs bank conflict 的方法是 kernel_8 的 padding 方案：
-//   保留 float4 向量写入，仅在 Bs 末尾追加 padding 列使行步长不是 32 的整数倍
+//   保留 float4 向量写入（保留 STS.128），仅追加 padding 列消除读 conflict
 // ══════════════════════════════════════════════════════════════════════════════
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
@@ -274,6 +286,23 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN),1) gemmResolveBankConfli
       // BN=128, innerRowBs=threadIdx.x / (BN / 4)=0,0,...,0,0，innerColGroupBs=threadIdx.x % (BN / 4)=0，1，2，3，4，...，31
       // 一个warp32个线程，访问B的同一行
       vecBs = reinterpret_cast<float4 *>(&B[(innerRowBs + outterColIdx + rowBs) * N + innerColGroupBs * 4 + initCol])[0];
+      // 读取B的时候：
+      //   一个线程取4个float32，就是16字节，2个线程就是32个字节，并且同一行。线程对使用一个sector。
+      //   所有的32个线程在同一行，元素连续，所以可以合并访问事务，8个线程共用一个cache line，所以32个线程一共4个访问事务
+      // 写入Bs的时候：
+      //   线程0写（0，0），线程1写（0，4），...
+      //   那么，间隔4个元素，，每 8 个线程 bank 重复，所以4-way bank conflict
+      // Bs 写入 bank conflict 分析：
+      //   线程 t（warp 0，innerRowB=0）写入 Bs[t*4 .. t*4+3]（步长=4 个 float）
+      //   若按标量分析：thread 0→bank 0，thread 8→bank 0（32=8×4）→ 4-way conflict
+      //
+      //   但此处写入是 float4 向量 store → 编译器生成 STS.128（128-bit SMEM store）
+      //   STS.128 由硬件分 4 个 phase 执行，每 phase 8 个线程：
+      //     Phase 0：thread  0-7  → float  0-31 → bank 0-31（各 1 次）→ 无冲突
+      //     Phase 1：thread  8-15 → float 32-63 → bank 0-31（各 1 次）→ 无冲突
+      //     Phase 2：thread 16-23 → float 64-95 → bank 0-31（各 1 次）→ 无冲突
+      //     Phase 3：thread 24-31 → float 96-127→ bank 0-31（各 1 次）→ 无冲突
+      //   每 phase 8 线程 × 4 float = 32 个元素，恰好覆盖全部 32 bank 各一次 → 实际 0 conflict
       // Bs[(innerRowBs + rowBs) * BN + innerColGroupBs * 4]  = vecBs.x;
       // Bs[(innerRowBs + rowBs) * BN + innerColGroupBs * 4 + 1]  = vecBs.y;
       // Bs[(innerRowBs + rowBs) * BN + innerColGroupBs * 4 + 2]  = vecBs.z;
@@ -282,7 +311,6 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN),1) gemmResolveBankConfli
       // 一个warp32个线程，innerColGroupBs / 2= 0，0，1，1，2，2，...，15，15  innerColGroupBs % 2 * 4= 0，4，0，4，0，4，...，0，4， innerRowBs* TN = 0,0,...,0,0
       // 2-Way bank conflict
       // 相比kernel6不重排，冲突更少了，但是 performance: (4377.1) GFLOPS小于，kernel6 的performance: (4698.7) GFLOPS
-
       Bs[((innerColGroupBs % (TN/4)) * 4 + innerRowBs * TN + rowBs * TN) * (BN / TN)  + (innerColGroupBs / 2)]  = vecBs.x;
       Bs[((innerColGroupBs % (TN/4)) * 4 + innerRowBs * TN + rowBs * TN + 1) * (BN / TN)  + (innerColGroupBs / 2)]  = vecBs.y;
       Bs[((innerColGroupBs % (TN/4)) * 4 + innerRowBs * TN + rowBs * TN + 2) * (BN / TN)  + (innerColGroupBs / 2)] = vecBs.z;

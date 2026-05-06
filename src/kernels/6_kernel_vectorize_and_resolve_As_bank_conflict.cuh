@@ -124,6 +124,18 @@
 //       语言规定数组类型本身不可赋值，不存在"把 float* 赋给 float[4]"的操作
 //       即使右侧 b 退化为 float*，也无法赋给左侧数组名（数组名不是可修改的指针变量）
 //
+// ── 实测性能数据（size=4096）────────────────────────────────────────────────
+//
+//   仅向量化（float4 GMEM 读写，As/Bs 行主序）：
+//     elapsed: 0.034993 s，performance: 3927.6 GFLOPS
+//
+//   向量化 + As 列主序（转置存储，消除计算阶段 As 读 conflict）：
+//     elapsed: 0.029250 s，performance: 4698.7 GFLOPS
+//
+//   差值：+771.1 GFLOPS（+19.6%），来源于路径② As 读 conflict 消除
+//   As 列主序引入 2-way 写 conflict（4×STS.32，加载阶段）但该代价
+//   被计算阶段 FMA 掩盖，净收益显著为正
+//
 // ── 提高 GFLOPS 的两条路径 ───────────────────────────────────────────────────
 //
 //   GFLOPS = FLOPs / 时间，FLOPs 固定，只能缩短时间：
@@ -727,6 +739,21 @@ gemmVectorize_v2(int M, int N, int K, float alpha, float *A,
       // BM=128,，1个warp32个线程的innerColGroupAs列组是0，1，...，0，1，列是0，4*128，...，0，4*128，innerRowAs行是0，0，1，1，...，15，15，
       // A的转置写入As的时候：
       //   线程0写入（0，0），线程1写入（4*128，0），，线程2写入（0,1），线程3写入（4*128,1）,写了2行，2-way bank conflict
+      //
+      // ── 行主序写 As 的 STS.128 phase 分析（补充说明上方"4-way"的修正）────────
+      //   行主序 4 个目标地址连续（步长=1 float）→ 编译器生成 STS.128（128-bit 向量 store）
+      //   STS.128 由硬件分 4 个 phase 执行，每 phase 8 个线程 × 4 float = 32 个元素：
+      //     Phase 0：thread  0-7  → As[ 0.. 31] → bank 0-31（各 1 次）→ 无冲突
+      //     Phase 1：thread  8-15 → As[32.. 63] → bank 0-31（各 1 次）→ 无冲突
+      //     Phase 2：thread 16-23 → As[64.. 95] → bank 0-31（各 1 次）→ 无冲突
+      //     Phase 3：thread 24-31 → As[96..127] → bank 0-31（各 1 次）→ 无冲突
+      //   → 行主序写 As 实际 0 conflict（上方"4-way"是标量逐元素分析，被 STS.128 phase 消除）
+      //
+      // ── 列主序写 As 无法使用 STS.128（补充说明"2-way conflict"的根因）────────
+      //   列主序 4 个目标地址步长 = BM = 128 float（非连续）→ 编译器无法生成 STS.128
+      //   → 退化为 4 条 STS.32（标量 store）
+      //   → innerColGroupAs=0 写 As[0..15]（bank 0..15），innerColGroupAs=1 写 As[512..527]（bank 0..15）
+      //   → 两组落在相同 bank，地址不同 → 2-way conflict（无法通过 phase 消除，因为根本没有 STS.128）
       float4 colVecAs;
       if ((innerColGroupAs * 4 + outterIdx) + 3 < K  && (initRow + innerRowAs + rowIdx) < M) {
         colVecAs = reinterpret_cast<float4 *>(&A[(initRow + innerRowAs + rowIdx) * K + innerColGroupAs * 4 + outterIdx])[0];
@@ -886,6 +913,9 @@ gemmVectorize_v2(int M, int N, int K, float alpha, float *A,
         // 行主序（对比）：As[(threadRowGroup*TM+rowNumIdx)*BK + colIdx]
         //   threadRowGroup 0 vs 1 地址相差 TM*BK=8*16=128=4×32 个元素 → bank 相同但地址不同 → 2-way conflict
         //   列主序（转置存储）正是为了消除此 conflict
+        // 行主序
+        // tmpAs[rowNumIdx] = As[(rowNumIdx + threadRowGroup*TM) * BK + colIdx];
+        // 列主序
         tmpAs[rowNumIdx] = As[colIdx * BM + (threadRowGroup * TM + rowNumIdx)];
       }
 

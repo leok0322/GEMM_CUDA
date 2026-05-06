@@ -1190,7 +1190,7 @@ void rungemmResolveBankConflicts(int M, int N, int K, float alpha, float *A,
   }
 }
 
-void runSgemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
+void rungemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
                                  float *B, float beta, float *C) {
   const uint BK = 8;
   const uint TM = 8;
@@ -1200,7 +1200,7 @@ void runSgemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
     const uint BN = 128;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankExtraCol<BM, BN, BK, TM, TN>
+    gemmResolveBankExtraCol_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
     // this is a hacky solution to the underlying problem
@@ -1209,7 +1209,7 @@ void runSgemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankExtraCol<BM, BN, BK, TM, TN>
+    gemmResolveBankExtraCol_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
     // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
     cudaCheck(cudaGetLastError());
@@ -1485,7 +1485,7 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     rungemmResolveBankConflicts(M, N, K, alpha, A, B, beta, C);
     break;
   case 8:
-    runSgemmResolveBankExtraCol(M, N, K, alpha, A, B, beta, C);
+    rungemmResolveBankExtraCol(M, N, K, alpha, A, B, beta, C);
     break;
   case 9:
     runSgemmAutotuned(M, N, K, alpha, A, B, beta, C);

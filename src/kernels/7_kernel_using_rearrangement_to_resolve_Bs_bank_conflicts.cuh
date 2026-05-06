@@ -310,7 +310,29 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN),1) gemmResolveBankConfli
 
       // 一个warp32个线程，innerColGroupBs / 2= 0，0，1，1，2，2，...，15，15  innerColGroupBs % 2 * 4= 0，4，0，4，0，4，...，0，4， innerRowBs* TN = 0,0,...,0,0
       // 2-Way bank conflict
-      // 相比kernel6不重排，冲突更少了，但是 performance: (4377.1) GFLOPS小于，kernel6 的performance: (4698.7) GFLOPS
+      // 相比kernel6不重排，引入了加载阶段的写Bs冲突，是 performance: (4377.1) GFLOPS小于，kernel6 的performance: (4698.7) GFLOPS
+
+      // ── 为何消除计算阶段 Bs 读 conflict 反而使性能下降 ──────────────────────
+      //
+      //   写入退化（与 As 列主序的退化完全对称，代价相同）：
+      //     kernel_6 Bs 写：STS.128 → phase → 0 conflict，1 条指令（加载阶段）
+      //     kernel_7 Bs 写：4×STS.32，2-way conflict，4 条指令（加载阶段，硬代价）
+      //
+      //   读取收益接近 0（与 As 列主序的情形不同）：
+      //     kernel_6 基准中，As 冲突已经消除（列主序，0 conflict）
+      //     计算阶段只剩 Bs 一个冲突源（4-way），stall 总量在 FMA 掩盖阈值以内
+      //     → Bs 读 conflict 的实际代价 ≈ 0，消除它的收益 ≈ 0
+      //
+      //   对比 As 列主序为何是正收益：
+      //     vectorize-only 基准中，As（2-way）+ Bs（4-way）两个冲突同时存在
+      //     组合 stall 量可能超出 FMA 掩盖阈值 → 有真实代价
+      //     消除 As 冲突同时降低组合 stall 量至阈值以下
+      //     → 直接收益 + Bs 冲突也因此得到更好掩盖的间接收益 → 净正收益
+      //
+      //   结论：FMA 掩盖有容量上限
+      //     单一冲突源（kernel_6 基准）：stall 在阈值内 → 已近乎免费 → 消除无益
+      //     双重冲突源（vectorize-only 基准）：stall 超阈值 → 有真实代价 → 消除有益
+      //     两次改动写入退化成本相同，但读取收益因基准状态不同而天壤之别
       Bs[((innerColGroupBs % (TN/4)) * 4 + innerRowBs * TN + rowBs * TN) * (BN / TN)  + (innerColGroupBs / 2)]  = vecBs.x;
       Bs[((innerColGroupBs % (TN/4)) * 4 + innerRowBs * TN + rowBs * TN + 1) * (BN / TN)  + (innerColGroupBs / 2)]  = vecBs.y;
       Bs[((innerColGroupBs % (TN/4)) * 4 + innerRowBs * TN + rowBs * TN + 2) * (BN / TN)  + (innerColGroupBs / 2)] = vecBs.z;

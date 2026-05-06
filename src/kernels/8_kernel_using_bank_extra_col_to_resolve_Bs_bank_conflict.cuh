@@ -160,45 +160,101 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN),1) gemmResolveBankExtraC
   for (uint outterColIdx {}; outterColIdx < K; outterColIdx += BK) {
     //加载As
     for (uint rowIdx {}; rowIdx < BM; rowIdx+=innerRowNumAs) {
-      float4 vecAs = reinterpret_cast<float4 *>(&A[(initRow + innerRowAs + rowIdx) * K + outterColIdx + innerColGroupAs * 4])[0];
-      // 行主序
-      // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4] = vecAs.x;
-      // As[(innerRowAs + rowIdx ) * BK + innerColGroupAs * 4 + 1] = vecAs.y;
-      // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4 + 2] = vecAs.z;
-      // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4 + 3] = vecAs.w;
+      if (initRow + innerRowAs + rowIdx < M && outterColIdx + innerColGroupAs * 4 + 3 < K) {
+        float4 vecAs = reinterpret_cast<float4 *>(&A[(initRow + innerRowAs + rowIdx) * K + outterColIdx + innerColGroupAs * 4])[0];
+        // 行主序
+        // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4] = vecAs.x;
+        // As[(innerRowAs + rowIdx ) * BK + innerColGroupAs * 4 + 1] = vecAs.y;
+        // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4 + 2] = vecAs.z;
+        // As[(innerRowAs + rowIdx) * BK + innerColGroupAs * 4 + 3] = vecAs.w;
 
-      // 列主序
-      As[(innerColGroupAs * 4) * BM + innerRowAs + rowIdx] = vecAs.x;
-      As[(innerColGroupAs * 4+ 1) * BM + innerRowAs + rowIdx] = vecAs.y;
-      As[(innerColGroupAs * 4+ 2) * BM + innerRowAs + rowIdx] = vecAs.z;
-      As[(innerColGroupAs * 4+ 3) * BM + innerRowAs + rowIdx] = vecAs.w;
+        // 列主序
+        As[(innerColGroupAs * 4) * BM + innerRowAs + rowIdx] = vecAs.x;
+        As[(innerColGroupAs * 4+ 1) * BM + innerRowAs + rowIdx] = vecAs.y;
+        As[(innerColGroupAs * 4+ 2) * BM + innerRowAs + rowIdx] = vecAs.z;
+        As[(innerColGroupAs * 4+ 3) * BM + innerRowAs + rowIdx] = vecAs.w;
+      } else if (initRow + innerRowAs + rowIdx < M && outterColIdx + innerColGroupAs * 4 + 2 < K) {
+        float3 vecAs = reinterpret_cast<float3 *>(&A[(initRow + innerRowAs + rowIdx) * K + outterColIdx + innerColGroupAs * 4])[0];
+        // 列主序
+        As[(innerColGroupAs * 4) * BM + innerRowAs + rowIdx] = vecAs.x;
+        As[(innerColGroupAs * 4+ 1) * BM + innerRowAs + rowIdx] = vecAs.y;
+        As[(innerColGroupAs * 4+ 2) * BM + innerRowAs + rowIdx] = vecAs.z;
+        As[(innerColGroupAs * 4+ 3) * BM + innerRowAs + rowIdx] = 0.0f;
+      } else if (initRow + innerRowAs + rowIdx < M && outterColIdx + innerColGroupAs * 4 + 1 < K) {
+        float2 vecAs = reinterpret_cast<float2 *>(&A[(initRow + innerRowAs + rowIdx) * K + outterColIdx + innerColGroupAs * 4])[0];
+        // 列主序
+        As[(innerColGroupAs * 4) * BM + innerRowAs + rowIdx] = vecAs.x;
+        As[(innerColGroupAs * 4+ 1) * BM + innerRowAs + rowIdx] = vecAs.y;
+        As[(innerColGroupAs * 4+ 2) * BM + innerRowAs + rowIdx] = 0.0f;
+        As[(innerColGroupAs * 4+ 3) * BM + innerRowAs + rowIdx] = 0.0f;
+      } else if (initRow + innerRowAs + rowIdx < M && outterColIdx + innerColGroupAs * 4 < K) {
+        float vecAs = A[(initRow + innerRowAs + rowIdx) * K + outterColIdx + innerColGroupAs * 4];
+        // 列主序
+        As[(innerColGroupAs * 4) * BM + innerRowAs + rowIdx] = vecAs;
+        As[(innerColGroupAs * 4+ 1) * BM + innerRowAs + rowIdx] = 0.0f;
+        As[(innerColGroupAs * 4+ 2) * BM + innerRowAs + rowIdx] = 0.0f;
+        As[(innerColGroupAs * 4+ 3) * BM + innerRowAs + rowIdx] = 0.0f;
+      } else {
+        // 列主序
+        As[(innerColGroupAs * 4) * BM + innerRowAs + rowIdx] = 0.0f;
+        As[(innerColGroupAs * 4+ 1) * BM + innerRowAs + rowIdx] = 0.0f;
+        As[(innerColGroupAs * 4+ 2) * BM + innerRowAs + rowIdx] = 0.0f;
+        As[(innerColGroupAs * 4+ 3) * BM + innerRowAs + rowIdx] = 0.0f;
+      }
+
     }
 
     // 加载Bs
     for (uint rowIdx {}; rowIdx < BK; rowIdx+=innerRowNumBs) {
-      float4 vecBs = reinterpret_cast<float4 *>(&B[(innerRowBs + rowIdx + outterColIdx) * N + initCol + innerColGroupBs * 4])[0];
-      // 行主序
-      // BN / 4 = 128 / 4 = 32，
-      // 一个WARP32个线程，innerColGroupBs=0，1，2，...，31，innerRowBs=0，0，0，0，，0，0
-      // rowIdx固定，sts32合并为sts128，再phase后，前8个线程访问Bs的一行，无bank conflict
-      // Bs[(innerRowBs +rowIdx) * BN + innerColGroupBs * 4] = vecBs.x;
-      // Bs[(innerRowBs +rowIdx) * BN + innerColGroupBs * 4 + 1] = vecBs.y;
-      // Bs[(innerRowBs +rowIdx) * BN + innerColGroupBs * 4 + 2] = vecBs.z;
-      // Bs[(innerRowBs +rowIdx) * BN + innerColGroupBs * 4 + 3] = vecBs.w;
+      if (innerRowBs + rowIdx + outterColIdx < K && initCol + innerColGroupBs * 4 + 3 < N) {
+        float4 vecBs = reinterpret_cast<float4 *>(&B[(innerRowBs + rowIdx + outterColIdx) * N + initCol + innerColGroupBs * 4])[0];
+        // 行主序
+        // BN / 4 = 128 / 4 = 32，
+        // 一个WARP32个线程，innerColGroupBs=0，1，2，...，31，innerRowBs=0，0，0，0，，0，0
+        // rowIdx固定，sts32合并为sts128，再phase后，前8个线程访问Bs的一行，无bank conflict
+        // Bs[(innerRowBs +rowIdx) * BN + innerColGroupBs * 4] = vecBs.x;
+        // Bs[(innerRowBs +rowIdx) * BN + innerColGroupBs * 4 + 1] = vecBs.y;
+        // Bs[(innerRowBs +rowIdx) * BN + innerColGroupBs * 4 + 2] = vecBs.z;
+        // Bs[(innerRowBs +rowIdx) * BN + innerColGroupBs * 4 + 3] = vecBs.w;
 
-      // PADDING后
-      // 一个WARP32个线程，innerColGroupBs=0，1，2，...，31，innerRowBs=0，0，0，0，，0，0
-      //rowIdx固定，sts32合并为sts128，再phase后，前0-7个线程访问Bs的一行，以此类推
-      // 下一个warp32个线程，innerColGroupBs=0，1，2，...，31，innerRowBs=0，0，0，0，，0，0
-      //rowIdx固定，sts32合并为sts128，再phase后，前0-7个线程访问Bs的一行，以此类推
-      //因为现在列数为BN + extraCols，所以在0-7个线程中间会空出extraCols个bank，
-      //有没有空出extraCols个bank不会影响bank conflict，但是合并指令sts128要求16字节对齐，一个bank是4字节，所以空出的extraCols需要是4的倍数，
-      // 如果padding是5，退化为 4×STS.32，出现了：4×指令数和写入 4-way bank conflict的情况，和kernel7一样，
-      // 并且由于padding并没有解决计算是Bs的bank conflict，导致性能比kernel7的还要差。为Average elapsed time: (0.036606) s, performance: (3754.5) GFLOPS. siz
-      Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4] = vecBs.x;
-      Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 1] = vecBs.y;
-      Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 2] = vecBs.z;
-      Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 3] = vecBs.w;
+        // PADDING后
+        // 一个WARP32个线程，innerColGroupBs=0，1，2，...，31，innerRowBs=0，0，0，0，，0，0
+        //rowIdx固定，sts32合并为sts128，再phase后，前0-7个线程访问Bs的一行，以此类推
+        // 下一个warp32个线程，innerColGroupBs=0，1，2，...，31，innerRowBs=0，0，0，0，，0，0
+        //rowIdx固定，sts32合并为sts128，再phase后，前0-7个线程访问Bs的一行，以此类推
+        //因为现在列数为BN + extraCols，所以在0-7个线程中间会空出extraCols个bank，
+        //有没有空出extraCols个bank不会影响bank conflict，但是合并指令sts128要求16字节对齐，一个bank是4字节，所以空出的extraCols需要是4的倍数，
+        // 如果padding是5，退化为 4×STS.32，出现了：4×指令数和写入 4-way bank conflict的情况，和kernel7一样，
+        // 并且由于padding并没有解决计算是Bs的bank conflict，导致性能比kernel7的还要差。为Average elapsed time: (0.036606) s, performance: (3754.5) GFLOPS. siz
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4] = vecBs.x;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 1] = vecBs.y;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 2] = vecBs.z;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 3] = vecBs.w;
+      } else if (innerRowBs + rowIdx + outterColIdx < K && initCol + innerColGroupBs * 4 + 2 < N) {
+        float3 vecBs = reinterpret_cast<float3 *>(&B[(innerRowBs + rowIdx + outterColIdx) * N + initCol + innerColGroupBs * 4])[0];
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4] = vecBs.x;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 1] = vecBs.y;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 2] = vecBs.z;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 3] = 0.0f;
+      } else if (innerRowBs + rowIdx + outterColIdx < K && initCol + innerColGroupBs * 4 + 1 < N) {
+        float2 vecBs = reinterpret_cast<float2 *>(&B[(innerRowBs + rowIdx + outterColIdx) * N + initCol + innerColGroupBs * 4])[0];
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4] = vecBs.x;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 1] = vecBs.y;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 2] =  0.0f;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 3] = 0.0f;
+      } else if (innerRowBs + rowIdx + outterColIdx < K && initCol + innerColGroupBs * 4 < N) {
+        float vecBs = B[(innerRowBs + rowIdx + outterColIdx) * N + initCol + innerColGroupBs * 4];
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4] = vecBs;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 1] = 0.0f;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 2] = 0.0f;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 3] = 0.0f;
+      } else {
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4] = 0.0f;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 1] = 0.0f;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 2] = 0.0f;
+        Bs[(innerRowBs + rowIdx) * (BN + extraCols) + innerColGroupBs * 4 + 3] = 0.0f;
+      }
+
 
     }
 
@@ -272,13 +328,29 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN),1) gemmResolveBankExtraC
   //   colIdx * 4 == resIdxN，逐步覆盖 TN 列
   for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
     for (uint colIdx {}; colIdx < writeBackColGroupNum; ++colIdx) {
-      // 先读出 C 的旧值，再执行 alpha*A*B + beta*C 的线性组合后写回
-      float4 vecWriteBack { reinterpret_cast<float4 *>(&C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4])[0] };
-      vecWriteBack.x = alpha * threadResults[rowIdx * TN + colIdx * 4    ] + beta * vecWriteBack.x;
-      vecWriteBack.y = alpha * threadResults[rowIdx * TN + colIdx * 4 + 1] + beta * vecWriteBack.y;
-      vecWriteBack.z = alpha * threadResults[rowIdx * TN + colIdx * 4 + 2] + beta * vecWriteBack.z;
-      vecWriteBack.w = alpha * threadResults[rowIdx * TN + colIdx * 4 + 3] + beta * vecWriteBack.w;
-      reinterpret_cast<float4 *>(&C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4])[0] = vecWriteBack;
+      if (initRow + threadRowGroup * TM + rowIdx < M && initCol + threadColGroup * TN + colIdx * 4 + 3 < N) {
+        // 先读出 C 的旧值，再执行 alpha*A*B + beta*C 的线性组合后写回
+        float4 vecWriteBack { reinterpret_cast<float4 *>(&C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4])[0] };
+        vecWriteBack.x = alpha * threadResults[rowIdx * TN + colIdx * 4    ] + beta * vecWriteBack.x;
+        vecWriteBack.y = alpha * threadResults[rowIdx * TN + colIdx * 4 + 1] + beta * vecWriteBack.y;
+        vecWriteBack.z = alpha * threadResults[rowIdx * TN + colIdx * 4 + 2] + beta * vecWriteBack.z;
+        vecWriteBack.w = alpha * threadResults[rowIdx * TN + colIdx * 4 + 3] + beta * vecWriteBack.w;
+        reinterpret_cast<float4 *>(&C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4])[0] = vecWriteBack;
+      } else if (initRow + threadRowGroup * TM + rowIdx < M && initCol + threadColGroup * TN + colIdx * 4 + 2 < N) {
+        float3 vecWriteBack { reinterpret_cast<float3 *>(&C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4])[0] };
+        vecWriteBack.x = alpha * threadResults[rowIdx * TN + colIdx * 4    ] + beta * vecWriteBack.x;
+        vecWriteBack.y = alpha * threadResults[rowIdx * TN + colIdx * 4 + 1] + beta * vecWriteBack.y;
+        vecWriteBack.z = alpha * threadResults[rowIdx * TN + colIdx * 4 + 2] + beta * vecWriteBack.z;
+        reinterpret_cast<float3 *>(&C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4])[0] = vecWriteBack;
+      } else if (initRow + threadRowGroup * TM + rowIdx < M && initCol + threadColGroup * TN + colIdx * 4 + 1 < N) {
+        float2 vecWriteBack { reinterpret_cast<float2 *>(&C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4])[0] };
+        vecWriteBack.x = alpha * threadResults[rowIdx * TN + colIdx * 4    ] + beta * vecWriteBack.x;
+        vecWriteBack.y = alpha * threadResults[rowIdx * TN + colIdx * 4 + 1] + beta * vecWriteBack.y;
+        reinterpret_cast<float2 *>(&C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4])[0] = vecWriteBack;
+      } else if (initRow + threadRowGroup * TM + rowIdx < M && initCol + threadColGroup * TN + colIdx * 4 < N) {
+        C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4] = alpha * threadResults[rowIdx * TN + colIdx * 4    ] +
+          beta *  C[(initRow + threadRowGroup * TM + rowIdx) * N + initCol + threadColGroup * TN + colIdx * 4];
+      }
     }
   }
 }

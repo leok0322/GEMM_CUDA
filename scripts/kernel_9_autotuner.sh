@@ -78,6 +78,28 @@ for bk in ${BK_VALUES[@]}; do
             # ── 前置条件检查 ────────────────────────────────────────────────
             # 所有参数都是编译期常量，非法组合会导致错误结果或编译失败，
             # 因此在编译前用数学条件提前过滤掉不合法的配置。
+            #
+            # ⚠ 已知缺失约束（导致结果文件中出现大量 Divergence!）：
+            #   本脚本只检查了向量加载对齐和 warp tile 量化这 6 个条件，
+            #   但漏掉了"矩阵尺寸必须是 tile 的整数倍"这一前提：
+            #     matrix_size % BM == 0
+            #     matrix_size % BN == 0
+            #
+            #   Kernel 9 内部无任何边界守卫（无 if (globalRow < M) 之类的检查），
+            #   它的正确性完全依赖调用方保证 M%BM==0 且 N%BN==0。
+            #   违反此条件时发生两类错误：
+            #
+            #   【直接越界】BN=256 测试 size=128（BN > N）：
+            #     加载 Bs 时读 B 的第 128..255 列（越界，取得垃圾值）；
+            #     写 C 时 wnIdx=2,3 的列偏移也越界，覆盖相邻内存。
+            #     → size=128 立即 Divergence（误差数十～数百）
+            #
+            #   【跨 size 污染】BM=256 测试 size=128（BM > M）：
+            #     runner.cu 分配 max_size×max_size 的大缓冲区，所有 size 共用。
+            #     size=128 时 wmIdx=2,3 越界写入 flat index 16384..（128-wide layout 的 C[128..][...]）；
+            #     size=256 时同一 flat index 16384 被解读为 C[64][0]（256-wide layout），
+            #     kernel 读取 beta*C 项时得到被污染的巨大值。
+            #     → size=128 通过验证（verify 只检查 0..16383），size=256 出现天文数字偏差
 
             # GMEM→SMEM 加载 As tile（BM×BK）：
             #   每行有 BK/4 个 float4 位置；NT 线程各取一个 float4，
@@ -185,7 +207,8 @@ for bk in ${BK_VALUES[@]}; do
             # if ! pipeline：
             #   有 pipefail：退出码 = cmake 的退出码；cmake 失败 → 进 then 块 ✓
             #   无 pipefail：退出码 = tee 的退出码（恒 0）  → if ! 0 = 真 → 始终进 then 块 ✗
-            if ! cmake --build cmake-build-release --target gemm -- -j 18 2>&1 | tee -a $OUTPUT; then
+            if ! cmake --build cmake-build-release --target gemm -- -j 18; then
+            # if ! cmake --build cmake-build-release --target gemm -- -j 18 2>&1 | tee -a $OUTPUT; then
               # cmake 与 echo 是两条独立命令，先后执行，不共享管道：
               #   cmake 的 stderr 已在上一行随管道写入终端和 $OUTPUT，此时 cmake 已结束。
               #   此处 echo 只是追加一条人读的失败摘要，| 与 |& 等价（echo 无 stderr）。
@@ -236,6 +259,8 @@ for bk in ${BK_VALUES[@]}; do
             #                   不是 fs << "Running kernel..."（两处写了内容相同的字符串，目标不同）。
             # 超过10秒的就不计入统计
             timeout -v 10 ./cmake-build-release/gemm 9 | tee -a $OUTPUT
+            echo "-------------------" | tee -a $OUTPUT
+            echo "" | tee -a $OUTPUT
           done
         done
       done

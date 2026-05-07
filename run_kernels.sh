@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# run.sh：项目根目录入口脚本，依次执行所有 kernel 并进行 ncu 性能采集
+# run_kernels.sh：项目根目录入口脚本，依次执行所有 kernel 并进行 ncu 性能采集
 #
 # 用法：
-#   chmod +x run.sh
-#   ./run.sh
+#   chmod +x run_kernels.sh
+#   ./run_kernels.sh
 
 SCRIPT_DIR="$(realpath "$(dirname "$0")/scripts")"
 

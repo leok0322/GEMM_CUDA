@@ -20,7 +20,7 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p "$ERROR_LOG_DIR"
 
 # seq 0 12：生成 0 1 2 ... 12 的序列，for 循环依次赋值给 i
-for i in $(seq 8 8); do
+for i in $(seq 9 9); do
     echo "Running kernel $i ..."
     # DEVICE=0        ：shell 内联环境变量语法，仅对紧跟的这条命令生效，不影响后续命令
     #                   等价于 export DEVICE=0 + 执行 + unset DEVICE，但更简洁
@@ -34,8 +34,14 @@ for i in $(seq 8 8); do
     # chmod +x        ：给脚本添加可执行权限，等价于 chmod 755
     #                   Linux 新建文件默认无可执行权限（-rw-r--r--），加 +x 后变为 -rwxr-xr-x
     #                   r=4, w=2, x=1，755 = rwx(7) r-x(5) r-x(5)
-    # 2> ：单独重定向 stderr 到 error_logs/，与 stdout（终端）分开
-    #      stderr 包含 cudaCheck 错误、verify_matrix 失败信息等
+    # 2> "$file" ：单独重定向 stderr 到文件，stdout 仍输出到终端，两路分开
+    #              stderr 包含 cudaCheck 错误、verify_matrix 失败信息等
+    # 对比：
+    #   2> "$file"  → stderr 重定向到文件（fd 2 → 磁盘文件）
+    #   2>&1        → stderr 重定向到 stdout 当前指向的位置（fd 2 → fd 1，目标随 fd 1 走）
+    #   两者的 "2>" 含义相同（重定向 fd 2），区别只在目标：
+    #     "$file" 是具体路径（磁盘文件）
+    #     &1      是 fd 1 的当前目标（可能是终端、管道或文件，取决于 fd 1 的状态）
     DEVICE=0 "$BINARY" "$i" 2> "$ERROR_LOG_DIR/kernel${i}_error.txt"
     echo "  -> errors: $ERROR_LOG_DIR/kernel${i}_error.txt"
 done

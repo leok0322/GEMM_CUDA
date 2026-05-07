@@ -267,6 +267,29 @@ target_link_libraries(simplest_kernel CUDA::cudart)
 #   注意：CMakeLists.txt 变了但未 Reload，Build 不会感知编译选项的变化
 #   命令行：
 #     cmake --build cmake-build-release --target gemm -- -j 18
+#     │      │      │                   │       │    │   │
+#     │      │      │                   │       │    │   └─ 传给底层构建工具（Ninja/Make）的并行参数
+#     │      │      │                   │       │    │      -j 18：同时启动 18 个编译进程
+#     │      │      │                   │       │    └─ "--"之后的所有参数透传给底层构建工具
+#     │      │      │                   │       │       cmake 自身不再解析 "--" 之后的内容
+#     │      │      │                   │       └─ 只构建名为 gemm 的 target（对应 add_executable(gemm ...)）
+#     │      │      │                   │          不构建 cuBLAS_gemm / simplest_kernel 等其他 target
+#     │      │      │                   └─ --target：指定要构建的目标名称
+#     │      │      └─ 构建目录：cmake 在此目录下寻找 build.ninja / Makefile
+#     │      │         由 cmake -B cmake-build-release 生成（Reload CMake Project 时创建）
+#     │      └─ --build：cmake 进入构建模式（而非配置模式）
+#     └─ cmake 主程序
+#
+#   cmake --build 与 make 的关系：
+#     cmake --build 是对底层构建工具的封装，本项目生成器为 Unix Makefiles，
+#     cmake 读取构建目录后实际执行：gmake -C cmake-build-release gemm -j 18
+#     两者本质等价，区别在于：
+#       cmake --build：生成器无关（Ninja/Make 均适用），可在任意目录执行（路径作参数）
+#       make         ：只对 Make 有效，必须在含 Makefile 的目录下执行
+#     make 的三种等价写法：
+#       cd cmake-build-release && make gemm -j 18   # cd 进去再执行
+#       make -C cmake-build-release gemm -j 18      # -C 指定目录，无需 cd
+#       cmake --build cmake-build-release ...        # cmake 内部处理 cd
 #
 # ── Rebuild ──────────────────────────────────────────────────────────────
 #   含义：等价于 Clean + Build，先删除所有产物，再完整重新编译

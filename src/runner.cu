@@ -918,6 +918,7 @@ void rungemm1DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
   //   → 需要 4096/8 = 512 个线程/block
   //   同时满足加载约束：BM*BK = BN*BK = 64*8 = 512（assert 验证）
   dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+  static_assert((BM * BN) % TM == 0);
   dim3 blockDim((BM * BN) / TM);
   gemm1DBlocktiling<BM, BN, BK, TM>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
@@ -1054,38 +1055,57 @@ void rungemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
     // (BM*BN) % (TM*TN) == 0：确保 blockDim.x = (BM*BN)/(TM*TN) 是整数
     // 若不整除，截断使 blockDim.x 偏小，部分输出元素无线程负责 → 结果错误
     // 注：条件应写 % == 0，而非 / == 0（后者判断商是否为零，BM*BN>=TM*TN 时永远 false）
-    assert((BM * BN) % (TM * TN) == 0);
+    static_assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
-    gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,false>
+    gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,false,false>
         <<<innerGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, 0, 0);
     // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
     cudaCheck(cudaGetLastError());
 
+    // ── 边界区域分配（四块互不重叠）────────────────────────────────────────
+    // 四个 if 条件的顺序无关紧要：每个区域由各自的条件唯一确定，互不重叠。
+    //   内部区域：IS_EDGE=false，gridDim=(N/BN, M/BM)，整除不越界，已在上面启动
+    //   右边缘：  N%BN!=0（N 方向有余量），M%BM==0（M 方向整除，无余量）
+    //   下边缘：  M%BM!=0（M 方向有余量），N%BN==0（N 方向整除，无余量）
+    //   右下角：  N%BN!=0 && M%BM!=0（两个方向都有余量）
+    //
+    // 关键：整除截断自然排除角块
+    //   rightEdgeGridDim(1, M/BM)：gridDim.y = M/BM（向下取整），刚好等于内部块行数
+    //     → 不包含下边缘那一行，角块被排除，只需检查 N 方向越界
+    //   leftEdgeGridDim(N/BN, 1)：gridDim.x = N/BN（向下取整），刚好等于内部块列数
+    //     → 不包含右边缘那一列，角块被排除，只需检查 M 方向越界
+    //   cornerEdgeGridDim(1, 1)：单独处理角块，N、M 两个方向都需要越界检查
+    // ────────────────────────────────────────────────────────────────────────
+
+    // 右下角：N、M 两个方向都有余量，需同时检查两个方向的越界
+    if (N % BN != 0 && M % BM != 0) {
+      dim3 cornerEdgeGridDim(1, 1);
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true,true>
+          <<<cornerEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, N/BN, M / BM);
+      // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
+      cudaCheck(cudaGetLastError());
+    }
+
+    // 右边缘：N 方向有余量，M 方向整除（gridDim.y=M/BM 不含角块行）
+    // → 只需检查 N 方向越界，M 方向 floor(M/BM) 个完整块不会越界
     if (N % BN != 0) {
       dim3 rightEdgeGridDim(1,  M / BM);
-      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,false,true>
         <<<rightEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C,N/BN, 0);
       // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
       cudaCheck(cudaGetLastError());
     }
 
-
+    // 下边缘：M 方向有余量，N 方向整除（gridDim.x=N/BN 不含角块列）
+    // → 只需检查 M 方向越界，N 方向 floor(N/BN) 个完整块不会越界
     if (M % BM != 0) {
       dim3 leftEdgeGridDim(N/BN,  1);
-      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true,false>
         <<<leftEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, 0, M / BM);
       // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
       cudaCheck(cudaGetLastError());
     }
 
-    // 右下角
-    if (N % BN != 0 && M % BM != 0) {
-      dim3 cornerEdgeGridDim(1, 1);
-      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
-          <<<cornerEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, N/BN, M / BM);
-      // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
-      cudaCheck(cudaGetLastError());
-    }
 
 
 
@@ -1095,7 +1115,7 @@ void rungemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
     const uint BN = 64;
     dim3 innerGridDim(N / BN,  M/ BM);
     // 同上，确保 blockDim.x 是整数
-    assert((BM * BN) % (TM * TN) == 0);
+    static_assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
     gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,false>
         <<<innerGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, 0, 0);
@@ -1141,6 +1161,7 @@ void rungemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     //保证线程数是整数
     static_assert((BM * BN) % (  TM * TN ) == 0, "线程数不是整数");
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    static_assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
     gemmVectorize_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
@@ -1152,6 +1173,7 @@ void rungemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     const uint BM = 64;
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    static_assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
     gemmVectorize_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
@@ -1199,15 +1221,19 @@ void rungemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
     const uint BM = 128;
     const uint BN = 128;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    static_assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
     gemmResolveBankExtraCol_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+    cudaCheck(cudaGetLastError());
   } else {
     // this is a hacky solution to the underlying problem
     // of not having proper bounds checking in the kernel
     const uint BM = 64;
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    static_assert((BM * BN) % (TM * TN) == 0 && "线程数不是整数");
     dim3 blockDim((BM * BN) / (TM * TN));
     gemmResolveBankExtraCol_v2<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
@@ -1216,45 +1242,82 @@ void rungemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
   }
 }
 
-void runSgemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
+void rungemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
                        float beta, float *C) {
   // A100
-  // const uint K9_BK = 16;
-  // const uint K9_TM = 4;
-  // const uint K9_TN = 4;
-  // const uint K9_BM = 64;
-  // const uint K9_BN = 64;
+  // const uint K9_BK = 64;
+  // const uint K9_TM = 16;
+  // const uint K9_TN = 16;
+  // const uint K9_BM = 256;
+  // const uint K9_BN = 256;
   // A6000
-  const uint K9_BK = 16;
-  const uint K9_TM = 8;
-  const uint K9_TN = 8;
-  const uint K9_BM = 128;
-  const uint K9_BN = 128;
+  // const vs constexpr：
+  //   const    : 语义是"不可修改"，是否编译期取决于初始化值：
+  //              字面量初始化（如 = 16）→ 满足"整数常量表达式"→ 可用于 static_assert / 模板参数
+  //              函数调用初始化（如 = foo()）→ 运行期常量 → 不能用于 static_assert
+  //   constexpr: 显式声明"必须在编译期求值"，编译器强制验证；
+  //              若初始化值不是编译期常量则直接编译报错，比 const 更安全
+  //   此处用 const 是 C 风格习惯写法，字面量初始化保证了编译期性质；
+  //   现代 C++ 推荐改写为 constexpr，明确表达意图。
+  const uint K9_BK = 64;
+  const uint K9_TM = 16;
+  const uint K9_TN = 16;
+  const uint K9_BM = 256;
+  const uint K9_BN = 256;
   dim3 blockDim(K9_NUM_THREADS);
 
+  // ── 加载 As（BM×BK）时每次迭代覆盖整数行 ──────────────────────────────────
+  // As 每行有 BK/4 个 float4；NT 线程各取一个 float4，每次迭代覆盖 (NT*4)/BK 行。
+  // (NT*4)/BK 必须是整数，否则某些线程跨行加载，导致行内碎片或越界。
+  static_assert(K9_BK % 4 == 0);
   static_assert(
-      (K9_NUM_THREADS * 4) % K9_BK == 0,
+      (K9_NUM_THREADS ) % (K9_BK /4) == 0,
       "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization issues "
       "during GMEM->SMEM tiling (loading only parts of the final row of Bs "
       "during each iteraion)");
+  // ── 加载 Bs（BK×BN）时每次迭代覆盖整数行 ──────────────────────────────────
+  // Bs 每行有 BN/4 个 float4；同上，(NT*4)/BN 必须是整数。
+  static_assert(K9_BN % 4 == 0);
   static_assert(
       (K9_NUM_THREADS * 4) % K9_BN == 0,
       "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization issues "
       "during GMEM->SMEM tiling (loading only parts of the final row of As "
       "during each iteration)");
+  static_assert((K9_BM * K9_BK) % (4 * K9_NUM_THREADS) == 0,
+                "K9_BM*K9_BK must be a multiple of 4*256 to vectorize loads");
+  // ── 加载 Bs 时循环能覆盖全部 BK 行（行间无遗漏）──────────────────────────────
+  // 同上，约束改为 BN*BK%(4*NT)==0。
+  static_assert((K9_BN * K9_BK) % (4 * K9_NUM_THREADS) == 0,
+                "K9_BN*K9_BK must be a multiple of 4*256 to vectorize loads");
+  // ── 计算时 N 方向完整列覆盖（QUANTIZATION）─────────────────────────────────
+  // 与 kernel 6 的差异：
+  //   kernel 6：threadCol = threadIdx % (BN/TN)，范围随 BN 动态变化，
+  //             约束为 BN%TN==0 且 blockDim%(BN/TN)==0（先有 BN，再推 blockDim）。
+  //             设计思路（先有 BN，再推 blockDim）：BN%TN==0 且 NT%(BN/TN)==0，
+  //   kernel 9：threadCol = threadIdx % 16，范围固定为 [0,16)，与 BN 无关，
+  //             约束变为 BN%(TN*16)==0（先固定 blockDim=256，倒推 BN 是 WN 的整数倍）。
+  //             WN = TN*16 硬编码，threadCol = threadIdx % 16 固定为 [0,16)，与 BN 无关。
+  //             必须满足 BN % WN == 0（即 WNITER = BN/WN 为整数），否则最后一次 wnIdx 迭代越界。
+  //             设计思路：先固定 blockDim=256=16×16，倒推 BN 约束（BN 是 TN*16 的整数倍）。
+  //   但两者不等价——反例 BN=64,TN=8 满足后者却因 threadCol 越界而出错。
+  //   BN=64,TN=8 满足 kernel 6 约束，但 kernel 9 中 threadCol=15
+  //   访问第 127 列，而 Bs 只有 64 列，越界。
   static_assert(
       K9_BN % (16 * K9_TN) == 0,
       "K9_BN must be a multiple of 16*K9_TN to avoid quantization effects");
+  // ── 计算时 M 方向完整行覆盖（QUANTIZATION）─────────────────────────────────
+  // 同上，M 方向：kernel 6 约束为 BM%TM==0 且 blockDim%(BM/TM)==0；
+  // kernel 9 约束为 BM%(TM*16)==0（threadRow 固定为 [0,16)，与 BM 无关）。
   static_assert(
       K9_BM % (16 * K9_TM) == 0,
       "K9_BM must be a multiple of 16*K9_TM to avoid quantization effects");
-  static_assert((K9_BM * K9_BK) % (4 * K9_NUM_THREADS) == 0,
-                "K9_BM*K9_BK must be a multiple of 4*256 to vectorize loads");
-  static_assert((K9_BN * K9_BK) % (4 * K9_NUM_THREADS) == 0,
-                "K9_BN*K9_BK must be a multiple of 4*256 to vectorize loads");
-
+  // ── 加载 As 时循环能覆盖全部 BM 行（行间无遗漏）──────────────────────────────
+  // 总迭代次数 = BM*BK/(NT*4) 必须是整数，等价于 BM % rowStrideA == 0。
+  // 与上方"行内整数"约束的分工：
+  //   (NT*4)%BK==0    → 每次迭代内覆盖整数行（行内无碎片）
+  //   BM*BK%(4*NT)==0 → 循环结束后 BM 行全部覆盖（行间无遗漏）
   dim3 gridDim(CEIL_DIV(N, K9_BN), CEIL_DIV(M, K9_BM));
-  sgemmAutotuned<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
+  gemmAutotuned<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
   cudaCheck(cudaGetLastError());
@@ -1488,7 +1551,7 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     rungemmResolveBankExtraCol(M, N, K, alpha, A, B, beta, C);
     break;
   case 9:
-    runSgemmAutotuned(M, N, K, alpha, A, B, beta, C);
+    rungemmAutotuned(M, N, K, alpha, A, B, beta, C);
     break;
   case 10:
     runSgemmWarptiling(M, N, K, alpha, A, B, beta, C);

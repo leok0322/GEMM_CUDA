@@ -693,7 +693,7 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
 //   constexpr 是变量/函数的存储说明符，不属于模板参数语法。
 //   虽然模板参数天然是编译期常量（语义上等同 constexpr），但语法上不能这样写。
 // ─────────────────────────────────────────────────────────────────────────────
-template <const int BM, const int BN, const int BK, const int TM, const int TN, const bool BOUNDARY>
+template <const int BM, const int BN, const int BK, const int TM, const int TN, const bool leftBOUNDARY, const bool rightBOUNDARY>
 __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   // __global__ kernel 参数不能是引用（const uint& offsetCol 会导致 illegal memory access）：
   //   引用底层是指针，指向主机内存地址。
@@ -793,7 +793,7 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   // ────────────────────────────────────────────────────────────────────────────
 
   // 是M\N方向的边界
-  if constexpr (BOUNDARY) {
+  if constexpr (leftBOUNDARY && rightBOUNDARY) {
     for (uint dotIdx = 0; dotIdx < recycle; ++dotIdx) {
       for (uint rowGroupIdx {}; rowGroupIdx < smemNum; ++rowGroupIdx) {
         // ✓ M/N 检查：A 只需 M 检查，B 只需 N 检查；K 方向在 recycle 循环内始终合法
@@ -873,6 +873,155 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
     for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
       for (uint colIdx {}; colIdx < TN; ++colIdx) {
         if ((InitRow + threadRowGroup * TM + rowIdx) < M &&  InitCol + threadColGroup * TN + colIdx < N) {
+          C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx] = alpha * treadResultArr[rowIdx * TN + colIdx] + beta * C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx];
+        }
+      }
+    }
+  }
+  // 行越界
+  else if (leftBOUNDARY && !rightBOUNDARY) {
+    for (uint dotIdx = 0; dotIdx < recycle; ++dotIdx) {
+      for (uint rowGroupIdx {}; rowGroupIdx < smemNum; ++rowGroupIdx) {
+        // ✓ M/N 检查：A 只需 M 检查，B 只需 N 检查；K 方向在 recycle 循环内始终合法
+        As[(innerRowGroupAs + rowGroupIdx * strideA) * BK + innerColAs] =  ((InitRow + innerRowGroupAs + rowGroupIdx * strideA) < M) ?A[(InitRow + innerRowGroupAs + rowGroupIdx * strideA) * K + dotIdx * BK + innerColAs]:0.0f;
+        Bs[(innerRowGroupBs + rowGroupIdx * strideB) * BN + innerColBs] =    B[(innerRowGroupBs + rowGroupIdx * strideB + dotIdx * BK) * N  + InitCol + innerColBs];
+      }
+      // 等待所有线程写入SMEM完毕
+      __syncthreads();
+
+      for (uint Idx {}; Idx < BK; ++Idx) {
+        float rowTemp[TM];
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          rowTemp[rowIdx] = As[(threadRowGroup * TM +rowIdx) * BK  + Idx];
+        }
+
+        float colTemp[TN];
+        for (uint colIdx {}; colIdx < TN; ++colIdx) {
+          colTemp[colIdx] = Bs[Idx * BN + threadColGroup * TN + colIdx];
+        }
+
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          for (uint colIdx {}; colIdx < TN; ++colIdx) {
+
+            treadResultArr[rowIdx * TN + colIdx] += rowTemp[rowIdx] * colTemp[colIdx];
+          }
+        }
+      }
+
+      __syncthreads();
+    }
+
+
+    if (remain_k > 0) {
+      for (uint rowGroupIdx {}; rowGroupIdx < smemNum; ++rowGroupIdx) {
+        As[(innerRowGroupAs + rowGroupIdx * strideA) * BK + innerColAs] = ((InitRow + innerRowGroupAs + rowGroupIdx * strideA) < M && recycle * BK + innerColAs < K)? A[(InitRow + innerRowGroupAs + rowGroupIdx * strideA) * K + recycle * BK + innerColAs]:0.0f;
+        Bs[(innerRowGroupBs + rowGroupIdx * strideB) * BN + innerColBs] = ((innerRowGroupBs + rowGroupIdx * strideB + recycle * BK) < K)? B[(innerRowGroupBs + rowGroupIdx * strideB + recycle * BK) * N  + InitCol + innerColBs]:0.0f;
+      }
+      __syncthreads();
+
+      for (uint dotIdx {}; dotIdx < BK; ++dotIdx) {
+        float rowTemp[TM];
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          rowTemp[rowIdx] = As[(threadRowGroup * TM +rowIdx) * BK  + dotIdx];
+        }
+
+        float colTemp[TN];
+        for (uint colIdx {}; colIdx < TN; ++colIdx) {
+          colTemp[colIdx] = Bs[dotIdx * BN + threadColGroup * TN + colIdx];
+        }
+
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          for (uint colIdx {}; colIdx < TN; ++colIdx) {
+
+            treadResultArr[rowIdx * TN + colIdx] += rowTemp[rowIdx] * colTemp[colIdx];
+          }
+        }
+      }
+
+      __syncthreads();
+
+    }
+
+
+
+    for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+      for (uint colIdx {}; colIdx < TN; ++colIdx) {
+        if ((InitRow + threadRowGroup * TM + rowIdx) < M) {
+          C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx] = alpha * treadResultArr[rowIdx * TN + colIdx] + beta * C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx];
+        }
+      }
+    }
+  }
+  // 列越界
+  else if (!leftBOUNDARY && rightBOUNDARY) {
+    for (uint dotIdx = 0; dotIdx < recycle; ++dotIdx) {
+      for (uint rowGroupIdx {}; rowGroupIdx < smemNum; ++rowGroupIdx) {
+        // ✓ M/N 检查：A 只需 M 检查，B 只需 N 检查；K 方向在 recycle 循环内始终合法
+        As[(innerRowGroupAs + rowGroupIdx * strideA) * BK + innerColAs] =  A[(InitRow + innerRowGroupAs + rowGroupIdx * strideA) * K + dotIdx * BK + innerColAs];
+        Bs[(innerRowGroupBs + rowGroupIdx * strideB) * BN + innerColBs] =   ((InitCol + innerColBs) < N)? B[(innerRowGroupBs + rowGroupIdx * strideB + dotIdx * BK) * N  + InitCol + innerColBs]:0.0f;
+      }
+      // 等待所有线程写入SMEM完毕
+      __syncthreads();
+
+      for (uint Idx {}; Idx < BK; ++Idx) {
+        float rowTemp[TM];
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          rowTemp[rowIdx] = As[(threadRowGroup * TM +rowIdx) * BK  + Idx];
+        }
+
+        float colTemp[TN];
+        for (uint colIdx {}; colIdx < TN; ++colIdx) {
+          colTemp[colIdx] = Bs[Idx * BN + threadColGroup * TN + colIdx];
+        }
+
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          for (uint colIdx {}; colIdx < TN; ++colIdx) {
+
+            treadResultArr[rowIdx * TN + colIdx] += rowTemp[rowIdx] * colTemp[colIdx];
+          }
+        }
+      }
+
+      __syncthreads();
+    }
+
+
+    if (remain_k > 0) {
+      for (uint rowGroupIdx {}; rowGroupIdx < smemNum; ++rowGroupIdx) {
+        As[(innerRowGroupAs + rowGroupIdx * strideA) * BK + innerColAs] = (recycle * BK + innerColAs < K)? A[(InitRow + innerRowGroupAs + rowGroupIdx * strideA) * K + recycle * BK + innerColAs]:0.0f;
+        Bs[(innerRowGroupBs + rowGroupIdx * strideB) * BN + innerColBs] = ((innerRowGroupBs + rowGroupIdx * strideB + recycle * BK) < K &&   (InitCol + innerColBs) < N)? B[(innerRowGroupBs + rowGroupIdx * strideB + recycle * BK) * N  + InitCol + innerColBs]:0.0f;
+      }
+      // 等待所有线程写入SMEM完毕
+      __syncthreads();
+
+      for (uint dotIdx {}; dotIdx < BK; ++dotIdx) {
+        float rowTemp[TM];
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          rowTemp[rowIdx] = As[(threadRowGroup * TM +rowIdx) * BK  + dotIdx];
+        }
+
+        float colTemp[TN];
+        for (uint colIdx {}; colIdx < TN; ++colIdx) {
+          colTemp[colIdx] = Bs[dotIdx * BN + threadColGroup * TN + colIdx];
+        }
+
+        for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+          for (uint colIdx {}; colIdx < TN; ++colIdx) {
+
+            treadResultArr[rowIdx * TN + colIdx] += rowTemp[rowIdx] * colTemp[colIdx];
+          }
+        }
+      }
+
+      __syncthreads();
+
+    }
+
+
+
+    for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+      for (uint colIdx {}; colIdx < TN; ++colIdx) {
+        if (InitCol + threadColGroup * TN + colIdx < N) {
           C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx] = alpha * treadResultArr[rowIdx * TN + colIdx] + beta * C[(InitRow + threadRowGroup * TM + rowIdx) * N + InitCol + threadColGroup * TN + colIdx];
         }
       }

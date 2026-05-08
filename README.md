@@ -16,8 +16,8 @@ C = α × (A @ B) + β × C
 | Kernel 1 | Naive | 103.5 | 2.0% |
 | Kernel 2 | Global Memory Coalescing | 677.1 | 13.0% |
 | Kernel 3 | Shared Memory Blocking | 919.5 | 17.7% |
-| Kernel 4 | 1D Blocktiling | 2405.2 | 46.3% |
-| Kernel 5 | 2D Blocktiling | 3761.0 | 72.4% |
+| Kernel 4 | Regs 1D Blocktiling | 2405.2 | 46.3% |
+| Kernel 5 | Regs 2D Blocktiling | 3761.0 | 72.4% |
 | Kernel 6 | 向量化 + As 列主序（消除 As Bank Conflict） | 4781.4 | 92.0% |
 | Kernel 7 | Bs 重排（尝试消除 Bs Bank Conflict，负优化） | 4429.7 | 85.2% |
 | Kernel 8 | Bs SMEM Padding（正确消除 Bs Bank Conflict） | 4976.8 | 95.8% |
@@ -90,7 +90,7 @@ SMEM 用量：As + Bs = 2 × 32×32×4 = 8 KiB。第二个 `__syncthreads()` 防
 
 ---
 
-### Kernel 4：1D Blocktiling（一维分块 Tiling）
+### Kernel 4：Regs 1D Blocktiling（寄存器缓存 + 一维分块 Tiling）
 
 **性能：2405.2 GFLOPS（+161.4% vs Kernel 3）**
 
@@ -114,7 +114,7 @@ for dotIdx in BK:
 
 ---
 
-### Kernel 5：2D Blocktiling（二维分块 Tiling）
+### Kernel 5：Regs 2D Blocktiling（寄存器缓存 + 二维分块 Tiling）
 
 **性能：3761.0 GFLOPS（+56.4% vs Kernel 4）**
 

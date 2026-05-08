@@ -1117,14 +1117,14 @@ void rungemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
     // 同上，确保 blockDim.x 是整数
     static_assert((BM * BN) % (TM * TN) == 0);
     dim3 blockDim((BM * BN) / (TM * TN));
-    gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,false>
+    gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,false, false>
         <<<innerGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, 0, 0);
     // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
     cudaCheck(cudaGetLastError());
 
     if (N % BN != 0) {
       dim3 rightEdgeGridDim(1,  M / BM);
-      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,false,true>
         <<<rightEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C,N/BN, 0);
       // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
       cudaCheck(cudaGetLastError());
@@ -1133,7 +1133,7 @@ void rungemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
 
     if (M % BM != 0) {
       dim3 leftEdgeGridDim(N/BN,  1);
-      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true,false>
         <<<leftEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, 0, M / BM);
       // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
       cudaCheck(cudaGetLastError());
@@ -1142,7 +1142,7 @@ void rungemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
     // 右下角
     if (N % BN != 0 && M % BM != 0) {
       dim3 cornerEdgeGridDim(1, 1);
-      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true>
+      gemm2DBlocktiling_v3<BM, BN, BK, TM, TN,true,true>
           <<<cornerEdgeGridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C, N/BN, M / BM);
       // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知
       cudaCheck(cudaGetLastError());
@@ -1244,13 +1244,42 @@ void rungemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
 
 void rungemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
                        float beta, float *C) {
-  // A100
+  // 编译结果：
+  // ptxas error   : Entry function '_Z13gemmAutotunedILi256ELi256ELi64ELi16ELi16EEviiifPfS0_fS0_' uses too much shared data (0x20000 bytes, 0xc000 max)
+  // ptxas info    : Used 168 registers, used 1 barriers, 16384 bytes smem, 400 bytes cmem[0]
+  // ptxas info    : Compile time = 154.239 ms
+  // ptxas info    : Compiling entry function '_Z13gemmAutotunedILi256ELi256ELi64ELi16ELi16EEviiifPfS0_fS0_' for 'sm_86'
+  // ptxas info    : Function properties for _Z13gemmAutotunedILi256ELi256ELi64ELi16ELi16EEviiifPfS0_fS0_
+  //     136 bytes stack frame, 332 bytes spill stores, 232 bytes spill loads
+
+  // ── 参数选择与 GPU 型号的关系 ────────────────────────────────────────────────
+  // 不同 GPU 的 shared memory 上限不同，BM/BN/BK 需要根据目标 GPU 调整：
+  //   shared memory 用量 = (BM*BK + BK*BN) * sizeof(float) = BK*(BM+BN)*4 字节
+  //
+  //   A100（sm_80）：共享内存最大 164 KB/block（需显式申请），保守可用 96 KB
+  //     BM=256, BN=256, BK=64 → (256+256)*64*4 = 131072 B = 128 KB  ← 需申请 164KB 模式
+  //
+  //   sm_86（RTX 3090/3080 等）：默认 static shared memory 上限 48 KB（0xC000）
+  //     BM=256, BN=256, BK=64 → 128 KB，直接超限：
+  //       ptxas error: uses too much shared data (0x20000 bytes, 0xc000 max)
+  //     需改小参数，如 BM=BN=128, BK=16 → (128+128)*16*4 = 16 KB ✓
+  //
+  // ── 寄存器压力 ──────────────────────────────────────────────────────────────
+  // threadResults 数组大小 = WMITER*WNITER*TM*TN，全部存在寄存器中。
+  // BM=256, BN=256, TM=16, TN=16 → WMITER=WNITER=1 时 TM*TN=256 个 float，
+  // 需 256 个寄存器（每 float 一个），超出编译器分配限额后产生 spill：
+  //   ptxas info: Used 168 registers, 332 bytes spill stores, 232 bytes spill loads
+  // spill 将寄存器内容溢出到 local memory（片外），访问延迟大幅上升。
+  // 通常 TM*TN <= 64（如 TM=TN=8）寄存器压力更合理。
+  //
+  // ── A100 最优参数（注释供对比）─────────────────────────────────────────────
   // const uint K9_BK = 64;
   // const uint K9_TM = 16;
   // const uint K9_TN = 16;
   // const uint K9_BM = 256;
   // const uint K9_BN = 256;
-  // A6000
+
+
   // const vs constexpr：
   //   const    : 语义是"不可修改"，是否编译期取决于初始化值：
   //              字面量初始化（如 = 16）→ 满足"整数常量表达式"→ 可用于 static_assert / 模板参数
@@ -1259,11 +1288,11 @@ void rungemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
   //              若初始化值不是编译期常量则直接编译报错，比 const 更安全
   //   此处用 const 是 C 风格习惯写法，字面量初始化保证了编译期性质；
   //   现代 C++ 推荐改写为 constexpr，明确表达意图。
-  const uint K9_BK = 64;
-  const uint K9_TM = 16;
-  const uint K9_TN = 16;
-  const uint K9_BM = 256;
-  const uint K9_BN = 256;
+  const uint K9_BK = 8;
+  const uint K9_TM = 8;
+  const uint K9_TN = 8;
+  const uint K9_BM = 128;
+  const uint K9_BN = 128;
   dim3 blockDim(K9_NUM_THREADS);
 
   // ── 加载 As（BM×BK）时每次迭代覆盖整数行 ──────────────────────────────────
@@ -1316,8 +1345,32 @@ void rungemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
   // 与上方"行内整数"约束的分工：
   //   (NT*4)%BK==0    → 每次迭代内覆盖整数行（行内无碎片）
   //   BM*BK%(4*NT)==0 → 循环结束后 BM 行全部覆盖（行间无遗漏）
+
+  // ── M / N / K 与 BM / BN / BK 的整除约束 ────────────────────────────────────
+  // 三个方向均可通过边界检查处理任意值，无需要求整除：
+  //
+  //   M 方向（不整除 BM）：
+  //     gridDim.y = CEIL_DIV(M, BM)，最后一行 block 的部分线程超出矩阵范围。
+  //     处理方案：IS_EDGE 模板参数 + 多次 launch（参考 kernel 8 的做法）：
+  //       内部块：gridDim=(N/BN, M/BM)，整除无越界
+  //       下边缘：M%BM!=0 → 单独 launch，加载/写回时检查 M 方向行号 < M
+  //
+  //   N 方向（不整除 BN）：与 M 方向对称，右边缘单独 launch，检查列号 < N
+  //
+  //   K 方向（不整除 BK）：
+  //     外层 K 循环最后一次迭代 outerColidx ∈ [K-K%BK, K)，
+  //     加载 As/Bs 时部分 k 列超出 K 范围。
+  //     处理方案：加载时越界补 0：
+  //       if (outerColidx + colIdx < K) As[...] = global_value;
+  //       else                          As[...] = 0.0f;
+  //     补 0 后参与点积：0 * anything = 0，不影响累加结果：
+  //       C[i,j] = Σ_{k<K} A[i,k]*B[k,j] + Σ_{k>=K} 0*0 = Σ_{k<K} A[i,k]*B[k,j]  ✓
+  //
+  //   当前 gemmAutotuned_v2 未实现上述边界检查，三个方向均要求整除；
+  //   添加边界检查后三个方向均可支持任意 M/N/K。
+  // ────────────────────────────────────────────────────────────────────────────
   dim3 gridDim(CEIL_DIV(N, K9_BN), CEIL_DIV(M, K9_BM));
-  gemmAutotuned<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
+  gemmAutotuned_v2<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
   cudaCheck(cudaGetLastError());

@@ -121,7 +121,7 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN),1) gemmResolveBankExtraC
   const uint innerColGroupAs { threadIdx.x % (BK / 4) };
   const uint innerRowAs { threadIdx.x / (BK / 4) };
   const uint innerRowNumAs { blockDim.x /  (BK / 4) };
-  // 加载As
+  // 加载Bs
   static_assert( BN % 4 == 0 && "列组不为整数");
   assert( blockDim.x % (BN / 4)  == 0 && "所有列不能覆盖");
   assert(BK * BN % (blockDim.x * 4) == 0 && "不能覆盖所有行");
@@ -143,7 +143,7 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN),1) gemmResolveBankExtraC
   static_assert((BN %  TN) == 0 && "列组不是整数");
   assert(blockDim.x % (BN / TN) == 0 && "不能覆盖完整列组");
   assert(BK * BM % (blockDim.x * TM * TN) == 0 && "不能覆盖完整行组");
-  const uint threadRowGroup {threadIdx.x / (BN/ TN)};
+  const uint threadRowGroup {threadIdx.x / (BN / TN)};
   const uint threadColGroup {threadIdx.x % (BN / TN)};
   float threadResults[TM * TN] {0.0f};
   float tmpAs[TM];

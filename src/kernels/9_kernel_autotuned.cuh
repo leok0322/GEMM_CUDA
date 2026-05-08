@@ -24,7 +24,7 @@
 //   设计动机：256 是 GPU 调优中的经验性好值（8个warp，足够隐藏延迟且寄存器压力
 //   不过高），先选定 256，再反推用 16×16 正方形排列映射线程，WM=TM*16 随之确定。
 //   即：设计时先拍定 256，代码中的原始常量却是 16。
-constexpr int K9_NUM_THREADS = 16 * 16;
+constexpr uint K9_NUM_THREADS = 16 * 16;
 
 // ── CPU/GPU 执行模型与断言机制 ───────────────────────────────────────────────
 // __global__ kernel 运行在 GPU 上，不是 CPU：
@@ -241,7 +241,8 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
 }
 
 template <const int BM,const int BN, const int BK, const int TM,const int TN>
-__global__ void __launch_bounds__(K9_NUM_THREADS,1) gemmAutotuned_v2 (float* A, float* B, float* C,int M, int N, int K, float alpha, float beta) {
+__global__ void __launch_bounds__(K9_NUM_THREADS,1) gemmAutotuned_v2 (int M, int N, int K, float alpha, float *A, float *B,
+                   float beta, float *C) {
 
   // 该block负责计算的起始行和列
   const uint initRow {blockIdx.y * BM};
@@ -249,41 +250,237 @@ __global__ void __launch_bounds__(K9_NUM_THREADS,1) gemmAutotuned_v2 (float* A, 
 
   // 该block的静态SMEM
   __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+  // padding
+  // 一个bank是4字节，4个bank就是16字节，合并128位指令，要求地址16字节对齐
+  const uint extraCol {4};
+  __shared__ float Bs[BK * (BN+extraCol)];
 
+  // 加载阶段
   // 该线程负责加载的行和列
   // 只要线程0进行静态断言
   // 可以在runner.cu中进行断言，不要在kernel中做静态或者动态断言
-  // if (threadIdx.x == 0) {
-  //   static_assert(BK % 4 == 0 && "列组不是整数");
-  //   static_assert(K9_NUM_THREADS % (BK / 4) == 0 && "不能覆盖完整列组");
-  //   static_assert(BM * BK % (K9_NUM_THREADS * 4) == 0 && "不能覆盖完整行");
-  // }
+  static_assert(BK % 4 == 0 && "列组不是整数");
+  static_assert(K9_NUM_THREADS % (BK / 4) == 0 && "不能覆盖完整列组");
+  static_assert(BM * BK % (K9_NUM_THREADS * 4) == 0 && "不能覆盖完整行");
   const uint loadAsColGroup = threadIdx.x % (BK / 4) ;
-  const uint  loadAsRowGroup = threadIdx.x / (BK / 4) ;
-  // 只要线程0进行静态断言
-  // 可以在runner.cu中进行断言，不要在kernel中做静态或者动态断言
-  // if (threadIdx.x == 0) {
-  //   static_assert(BN % 4 == 0 && "列组不是整数");
-  //   static_assert(K9_NUM_THREADS % (BN / 4) == 0 && "不能覆盖完整列组");
-  //   static_assert(BN * BK % (K9_NUM_THREADS * 4) == 0 && "不能覆盖完整行");
-  // }
+  const uint loadAsRow = threadIdx.x / (BK / 4) ;
+  // ── 加载步长（每次循环覆盖的行数）────────────────────────────────────────────
+  // 每次循环：K9_NUM_THREADS 个线程各自加载 1 个 float4，
+  //   As 每行有 BK/4 个 float4 → 每次覆盖 K9_NUM_THREADS / (BK/4) 行。
+  //
+  // 【错误写法及其报错】
+  //   曾误写为 BM*BK/(K9_NUM_THREADS*4)，该值是"需要几次循环"（循环次数），不是步长。
+  //   以 BM=128, BK=8, K9_NUM_THREADS=256 为例：
+  //     循环次数 = 128*8/(256*4) = 1   ← 只需 1 次
+  //     正确步长 = 256/(8/4)    = 128  ← 每次覆盖 128 行
+  //   将循环次数(1)当步长使用 → 循环运行 128 次：
+  //     RowIdx=0 : As[(loadAsRow+0)*BK + ...], loadAsRow ∈ [0,127] → 正常
+  //     RowIdx=1 : As[(loadAsRow+1)*BK + ...], loadAsRow=127 → As[128*8] 越界写入
+  //   → 报错：[CUDA ERROR] at file gemm.cu:163:
+  //            an illegal memory access was encountered
+  //   根因：shared memory 越界写入，CUDA 运行时在下一个同步点（cudaDeviceSynchronize）
+  //         检测到非法访问并通过 cudaGetLastError() 返回 cudaErrorIllegalAddress。
+  // ────────────────────────────────────────────────────────────────────────────
+  const uint loadAsRowNumberPerCycle {K9_NUM_THREADS / (BK / 4)};
+  static_assert(BN % 4 == 0 && "列组不是整数");
+  static_assert(K9_NUM_THREADS % (BN / 4) == 0 && "不能覆盖完整列组");
+  static_assert(BN * BK % (K9_NUM_THREADS * 4) == 0 && "不能覆盖完整行");
   const uint loadBsColGroup = threadIdx.x % (BN / 4);
-  const uint  loadBsRowGroup = threadIdx.x / (BN / 4);
+  const uint loadBsRow = threadIdx.x / (BN / 4);
+  // Bs 每行有 BN/4 个 float4 → 每次覆盖 K9_NUM_THREADS / (BN/4) 行，同上推导。
+  const uint loadBsRowNumberPerCycle {K9_NUM_THREADS / (BN / 4)};
 
-  // 该线程负责计算的行和列
-  const uint WN { 16 * TN};
-  const uint WM {16 * TM};
+
+  // 计算阶段
+  // ── 曾犯错误1：static_assert 放在 if (threadIdx.x == 0) 内 ─────────────────
+  // 曾误写为：
+  //   if (threadIdx.x == 0) {
+  //       static_assert(BK % 4 == 0 && "列组不是整数");
+  //       static_assert(K9_NUM_THREADS % (BK / 4) == 0 && "不能覆盖完整列组");
+  //   }
+  // static_assert 是编译期指令，nvcc 实例化模板时立即求值，与任何运行期 if 无关。
+  // if (threadIdx.x == 0) 是运行期条件，对编译期的 static_assert 完全无效——
+  // 无论 if 条件是否成立，static_assert 都会在编译时执行（也可能永远不执行，取决于
+  // 编译器是否认为该分支可达）。正确做法是将 static_assert 直接放在函数体顶层。
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // 该线程在block中的二维分布
+  constexpr uint threadColNum {16};
+  const uint threadColGroup {threadIdx.x % threadColNum};
+  const uint threadRowGroup {threadIdx.x / threadColNum};
+  // block中的行
+  static_assert(K9_NUM_THREADS % threadColNum == 0 && "行不是整数");
+  // block中的线程有多少行
+  constexpr uint threadRowNum {K9_NUM_THREADS / threadColNum};
+  // 一个block中所有线程能够负责的行数WM和列数WN
+  constexpr uint WN {threadColNum * TN};
+  constexpr uint WM {threadRowNum * TM};
+  // 暗含static_assert(BM >= WM && "一个block能处理的行数要超过BM");
+  // 不需要边界检查
   static_assert(BM % WM == 0 && "能覆盖完整的行");
+  // static_assert(BN >= WN && "一个block能处理的列出要超过BN");
+  // 不需要边界检查
   static_assert(BN % WN == 0 && "能覆盖完整的列");
+  // 该线程缓存的As、Bs元素
+  float regAsCache[TM];
+  float regBsCache[TN];
+  // 需要几次迭代能覆盖所有的行和列
+  const uint WMITER {BM / WM};
+  const uint WNITER {BN / WN};
+
+  // ── 曾犯错误2：threadResults 大小只够一个 warp tile ──────────────────────────
+  // 曾误写为：float threadResults[TM * TN] {0.0f};
+  // 每个线程参与 WMITER × WNITER 个 warp tile 的计算，需要为每个 tile 保存独立结果。
+  // TM*TN 只够存一个 warp tile 的结果；WMITER>1 或 WNITER>1 时，
+  // 不同 warp tile 的结果写入相同下标，相互覆盖 → 输出错误。
+  // 正确大小：WMITER * WNITER * TM * TN（所有 warp tile 的结果总量）。
+  //
+  // ── 曾犯错误3：累积下标不含 warp tile 索引 ────────────────────────────────────
+  // 曾误写为：threadResults[rowIdx * TN + colIdx] += ...;
+  // 该下标完全忽略 wrowIdx / wcolIdx，不同 warp tile（wrowIdx=0, WM, 2*WM...）
+  // 的结果都落入 [0, TM*TN) 同一段，各 tile 结果混叠累加 → 输出错误。
+  // 正确写法：将 wrowIdx/wcolIdx 除以步长 WM/WN 换算成紧凑序号，再乘以 TM/TN 得偏移：
+  //   threadResults[(wrowIdx/WM * TM + rowIdx) * (WNITER*TN) + wcolIdx/WN * TN + colIdx]
+  // wrowIdx/WM ∈ {0,1,...,WMITER-1}（序号），*TM 得紧凑行偏移；wcolIdx/WN 同理。
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // 该线程计算结果缓存
+  // 当BM=WM,BN=WN时，WMITER=WNITER=1，就是之前kernel的情形
+  float threadResults[WMITER * TM * WNITER * TN] {0.0f};
+
+
+  // 向量写回C
+  static_assert(TN % 4 == 0 && "列组不是整数");
+
 
   // 沿k方向循环
   for (uint outerColidx {}; outerColidx < K; outerColidx+=BK) {
-    // 加载As和Bs
+    // 加载阶段
+    for (uint RowIdx {}; RowIdx < BM; RowIdx+=loadAsRowNumberPerCycle) {
+      // 加载As
+      float4 loadVecAs { reinterpret_cast<float4 *>(&A[(initRow + loadAsRow + RowIdx) * K + loadAsColGroup * 4 + outerColidx])[0] };
+      // 行主序
+      // As[(loadAsRow + RowIdx) * BK + loadAsColGroup * 4] = loadVecAs.x;
+      // As[(loadAsRow + RowIdx) * BK + loadAsColGroup * 4 + 1] = loadVecAs.y;
+      // As[(loadAsRow + RowIdx) * BK + loadAsColGroup * 4 + 2] = loadVecAs.z;
+      // As[(loadAsRow + RowIdx) * BK + loadAsColGroup * 4 + 3] = loadVecAs.w;
 
+      // 列主序
+      As[(loadAsColGroup * 4) * BM + loadAsRow + RowIdx] = loadVecAs.x;
+      As[(loadAsColGroup * 4 + 1) * BM + loadAsRow + RowIdx] = loadVecAs.y;
+      As[(loadAsColGroup * 4 + 2) * BM + loadAsRow + RowIdx] = loadVecAs.z;
+      As[(loadAsColGroup * 4 + 3) * BM + loadAsRow + RowIdx] = loadVecAs.w;
 
+    }
+
+    // 加载Bs
+    for (uint RowIdx {}; RowIdx < BK; RowIdx+=loadBsRowNumberPerCycle) {
+      float4 loadVecBs { reinterpret_cast<float4 *>(&B[(loadBsRow + RowIdx + outerColidx) * N + initCol + loadBsColGroup * 4])[0] };
+      // 行主序
+      // Bs[(loadBsRow + RowIdx) * BN + loadBsColGroup * 4] = loadVecBs.x;
+      // Bs[(loadBsRow + RowIdx) * BN + loadBsColGroup * 4 + 1]  = loadVecBs.y;
+      // Bs[(loadBsRow + RowIdx) * BN + loadBsColGroup * 4 + 2]  = loadVecBs.z;
+      // Bs[(loadBsRow + RowIdx) * BN + loadBsColGroup * 4 + 3]  = loadVecBs.w;
+
+      // 行主序+paading
+      Bs[(loadBsRow + RowIdx) * (BN + extraCol) + loadBsColGroup * 4] = loadVecBs.x;
+      Bs[(loadBsRow + RowIdx) * (BN + extraCol) + loadBsColGroup * 4 + 1]  = loadVecBs.y;
+      Bs[(loadBsRow + RowIdx) * (BN + extraCol) + loadBsColGroup * 4 + 2]  = loadVecBs.z;
+      Bs[(loadBsRow + RowIdx) * (BN + extraCol) + loadBsColGroup * 4 + 3]  = loadVecBs.w;
+
+    }
+
+    __syncthreads();
+
+    // ── 计算阶段：两种等价写法 ──────────────────────────────────────────────
+    //
+    // threadResults 大小：WMITER * WNITER * TM * TN
+    //   每个线程的寄存器数组，存储该线程在所有 warp tile 中负责的输出元素。
+    //
+    // 【写法 A：绝对偏移循环（当前实现）】
+    //   外层循环变量 wrowIdx/wcolIdx 是块内绝对偏移，步长 WM/WN。
+    //   wrowIdx ∈ {0, WM, 2*WM, ..., (WMITER-1)*WM}，步长 WM = 16*TM。
+    //   不能直接用 wrowIdx 做 threadResults 下标：
+    //     相邻 tile 间有 (WM-TM)=15*TM 个空洞，下标不连续，
+    //     最大值 ≈ BM * WNITER*TN，远超数组大小，越界。
+    //   必须先除以步长换算成序号，再乘以每 tile 的行/列数得紧凑偏移：
+    //     wmIdx  = wrowIdx / WM        ∈ {0, 1, ..., WMITER-1}
+    //     wnIdx  = wcolIdx / WN        ∈ {0, 1, ..., WNITER-1}
+    //     行偏移 = wmIdx * TM + rowIdx ∈ [0, WMITER*TM)
+    //     列偏移 = wnIdx * TN + colIdx ∈ [0, WNITER*TN)
+    //     下标   = 行偏移 * (WNITER*TN) + 列偏移
+    //            = (wmIdx*TM + rowIdx) * (WNITER*TN) + wnIdx*TN + colIdx
+    //     最大值 = WMITER*WNITER*TM*TN - 1  ✓
+    //
+    // 【写法 B：序号循环（等价，更直观，与 gemmAutotuned 第一个 kernel 一致）】
+    //   外层直接用序号 wmIdx/wnIdx，无需除法换算，下标天然紧凑：
+    //
+    //   for (uint wmIdx {}; wmIdx < WMITER; ++wmIdx) {           // tile 行序号
+    //     for (uint wnIdx {}; wnIdx < WNITER; ++wnIdx) {         // tile 列序号
+    //       uint wrowOff = wmIdx * WM;   // 转回绝对偏移，用于访问 As
+    //       uint wcolOff = wnIdx * WN;   // 转回绝对偏移，用于访问 Bs
+    //       for (uint innerColIdx {}; innerColIdx < BK; ++innerColIdx) {
+    //         for (uint rowIdx {}; rowIdx < TM; ++rowIdx)
+    //           regAsCache[rowIdx] = As[(wrowOff + threadRowGroup*TM + rowIdx)*BK + innerColIdx];
+    //         for (uint colIdx {}; colIdx < TN; ++colIdx)
+    //           regBsCache[colIdx] = Bs[innerColIdx*BN + wcolOff + threadColGroup*TN + colIdx];
+    //         for (uint rowIdx {}; rowIdx < TM; ++rowIdx)
+    //           for (uint colIdx {}; colIdx < TN; ++colIdx)
+    //             // wmIdx/wnIdx 已是序号，直接 *TM/*TN 得紧凑偏移，无需除法
+    //             threadResults[(wmIdx*TM + rowIdx)*(WNITER*TN) + wnIdx*TN + colIdx]
+    //                 += regAsCache[rowIdx] * regBsCache[colIdx];
+    //       }
+    //     }
+    //   }
+    //
+    // 写法 A 和写法 B 下标公式完全相同（wmIdx == wrowIdx/WM），
+    // 区别仅在循环变量形式：A 用绝对偏移需要除法换算，B 用序号天然紧凑。
+    // ────────────────────────────────────────────────────────────────────────
+
+    // 写法 A 实现
+    for (uint wrowIdx {}; wrowIdx < BM; wrowIdx+=WM) {
+      for (uint wcolIdx {}; wcolIdx < BN; wcolIdx+=WN) {
+        for (uint innerColIdx{}; innerColIdx < BK; ++innerColIdx) {
+          for (uint rowIdx {};rowIdx < TM; ++rowIdx) {
+            // 行主序
+            // regAsCache[rowIdx] = As[(wrowIdx + threadRowGroup * TM + rowIdx) * BK + innerColIdx];
+
+            // 列主序
+            regAsCache[rowIdx] = As[innerColIdx * BM + wrowIdx + threadRowGroup * TM + rowIdx];
+          }
+          for (uint colIdx {}; colIdx < TN; ++colIdx) {
+            // 行主序
+            // regBsCache[colIdx] = Bs[innerColIdx * BN + wcolIdx + threadColGroup * TN + colIdx];
+
+            // 行主序+padding
+            regBsCache[colIdx] = Bs[innerColIdx * (BN + extraCol) + wcolIdx + threadColGroup * TN + colIdx];
+          }
+          for (uint rowIdx {}; rowIdx < TM; ++rowIdx) {
+            for (uint colIdx {}; colIdx < TN; ++colIdx) {
+              // wrowIdx/WM → wmIdx（序号），*TM 得紧凑行偏移；wcolIdx/WN 同理, *TN得紧凑行偏移
+              // 每个线程保存自己的计算结果
+              threadResults[(wrowIdx/WM * TM + rowIdx) * (WNITER * TN) + wcolIdx/WN * TN + colIdx] += regAsCache[rowIdx] * regBsCache[colIdx];
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();
   }
 
-
-
+  // 向量写回C
+  for (uint wrowIdx {}; wrowIdx < BM; wrowIdx+=WM) {
+    for (uint wcolIdx {}; wcolIdx < BN; wcolIdx+=WN) {
+      for (uint rowIdx{}; rowIdx < TM; ++rowIdx) {
+        for (uint colGroupIdx{}; colGroupIdx < TN / 4; ++colGroupIdx) {
+          float4 writeBackVec { reinterpret_cast<float4 *>(&C[(initRow + threadRowGroup * TM + wrowIdx + rowIdx) * N + initCol + threadColGroup * TN + wcolIdx + colGroupIdx * 4])[0] };
+          writeBackVec.x =  alpha * threadResults[((wrowIdx / WM) * TM + rowIdx) * (WNITER * TN) + wcolIdx/WN * TN + colGroupIdx * 4] + beta * writeBackVec.x;
+          writeBackVec.y =  alpha * threadResults[((wrowIdx / WM) * TM + rowIdx) * (WNITER * TN) + wcolIdx/WN * TN + colGroupIdx * 4 + 1] + beta * writeBackVec.y;
+          writeBackVec.z =  alpha * threadResults[((wrowIdx / WM) * TM + rowIdx) * (WNITER * TN) + wcolIdx/WN * TN + colGroupIdx * 4 + 2] + beta * writeBackVec.z;
+          writeBackVec.w =  alpha * threadResults[((wrowIdx / WM) * TM + rowIdx) * (WNITER * TN) + wcolIdx/WN * TN + colGroupIdx * 4 + 3] + beta * writeBackVec.w;
+          reinterpret_cast<float4 *>(&C[(initRow + threadRowGroup * TM + wrowIdx + rowIdx) * N + threadColGroup * TN + wcolIdx + colGroupIdx * 4 + initCol])[0] = writeBackVec;
+        }
+      }
+    }
+  }
 }

@@ -240,6 +240,79 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
   }
 }
 
+// ── kernel 9 (v2) 相比 kernel 8 性能提升的原因分析 ──────────────────────────
+  //
+  // 两个 kernel 的 shared memory 布局完全相同：
+  //   As：列主序（转置存储），读 As 时 BM 方向连续 → 消除 bank conflict
+  //   Bs：行主序 + extra col（padding），读 Bs 时 BN 方向连续 → 消除 bank conflict
+  // 相同参数：BM=BN=128, BK=8, TM=TN=8, 256 线程，WMITER=WNITER=1
+  //
+  // 【原因1：加载阶段边界检查的代价】
+  //   kernel 8 (gemmResolveBankExtraCol_v2)：
+  //     加载 As 时有多层降级边界检查（float4 → float3 → float2 → float1 → 零）：
+  //       if (row < M && col+3 < K) { float4 load }
+  //       else if (row < M && col+2 < K) { float3 load }
+  //       else if (row < M && col+1 < K) { float2 load }
+  //       else if (row < M && col < K) { float1 load }
+  //       else { 写零 }
+  //     测试尺寸（128~4096，均为 BM/BN/BK 整数倍）永远不触发边界分支，
+  //     但分支的存在有三类代价：
+  //       a. 编译器必须为每条分支生成条件跳转指令 → 每次 load 多 4~5 条比较/跳转
+  //       b. 多条代码路径迫使编译器保留更多中间寄存器值 → 寄存器压力上升
+  //       c. 编译器难以跨分支做指令重排和流水线合并 → 生成 PTX 质量下降
+  //
+  //   kernel 9 v2 (gemmAutotuned_v2)：
+  //     加载阶段无任何边界检查，直接 float4 加载：
+  //       float4 loadVecAs = reinterpret_cast<float4 *>(...)[0];
+  //     代码路径唯一 → 编译器可充分展开、重排、流水线合并 → 生成指令数最少
+  //
+  // 【原因2：边界检查代码复杂度影响寄存器分配】
+  //   kernel 8 的多层 if-else 让编译器在寄存器分配时必须同时保活多个分支的变量
+  //   （float4/float3/float2 的临时寄存器），即使这些分支实际不执行。
+  //   kernel 9 v2 只有一条 float4 路径，寄存器压力更低，
+  //   编译器有更多空闲寄存器用于缓存循环变量，减少指令数和内存访问。
+  //
+  // 结论：布局相同时，代码复杂度（边界检查的有无）决定编译器能生成多优质的 PTX，
+  //       进而影响实际执行性能。去掉 kernel 8 的边界检查后两者性能应接近一致。
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // ── 4096 维度性能低于 2048 的原因分析 ────────────────────────────────────────
+  //
+  // 【背景：算术强度与 Roofline 模型】
+  //   Roofline 模型将性能上界分为两段：
+  //     算力段：FLOP/s ≤ 峰值算力（计算密集区，受 CUDA core 数量限制）
+  //     带宽段：FLOP/s ≤ 峰值带宽 × 算术强度（带宽密集区，受内存带宽限制）
+  //   交叉点（ridge point）= 峰值算力 / 峰值带宽，约 38 FLOP/byte（本机估算值）
+  //
+  //   算术强度 I = FLOP / Bytes_from_DRAM：
+  //     每个 BM×BN 块：执行 2*BM*BN*K 次 FLOP，
+  //     从 DRAM 加载 (BM+BN)*K*4 字节（理想复用，每 BK 列加载一次 block tile）
+  //     → I ≈ 2*BM*BN / ((BM+BN)*4) = 2*128*128 / (256*4) = 32 FLOP/byte
+  //   32 < 38（ridge point）→ kernel 9 处于带宽受限区，FLOP/s 上界由带宽决定
+  //
+  // 【原因：L2 缓存命中率随矩阵尺寸下降】
+  //   本机 L2 容量约 6 MB（sm_86，参考 deviceQuery 输出）。
+  //   三个矩阵（A + B + C）的总数据量：
+  //     M=2048：2048*2048*4*3 = 50 MB  → 远超 L2，但时间局部性使部分 block tile
+  //             在 L2 中驻留（A 的列 tile / B 的行 tile 被多个 block 复用）
+  //     M=4096：4096*4096*4*3 = 192 MB → L2 完全被击穿（thrashing），
+  //             每次 block tile 加载几乎全部来自 DRAM（L2 命中率接近 0%）
+  //
+  //   两种尺寸均处于带宽受限区，但 2048 时部分访问可命中 L2（延迟 ~200 cycle）
+  //   而非每次都等 DRAM（延迟 ~600 cycle），等效带宽略高于 4096。
+  //   → 4096 的实测 GFLOP/s 低于 2048，但差距不大（均受制于峰值内存带宽上限）
+  //
+  // 【为何差距不显著】
+  //   带宽受限区的上界是峰值带宽，而非 L2 带宽；
+  //   两种尺寸都已触及或接近 DRAM 带宽瓶颈，L2 命中率的差异只体现为小幅波动。
+  //   若算术强度 > 38（如 BK=64），则进入计算密集区，
+  //   L2 命中率的差异对 GFLOP/s 影响将更不明显。
+  //
+  // 结论：BK=8 导致算术强度（32 FLOP/byte）低于 ridge point（38），
+  //       kernel 处于带宽受限区；4096 矩阵完全击穿 L2（6 MB），
+  //       实际访问 DRAM 频率高于 2048，导致等效带宽略低，GFLOP/s 小幅下降。
+  // ────────────────────────────────────────────────────────────────────────────
+
 template <const int BM,const int BN, const int BK, const int TM,const int TN>
 __global__ void __launch_bounds__(K9_NUM_THREADS,1) gemmAutotuned_v2 (int M, int N, int K, float alpha, float *A, float *B,
                    float beta, float *C) {

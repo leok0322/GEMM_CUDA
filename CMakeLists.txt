@@ -142,6 +142,40 @@ add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-linein
 add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:--ptxas-options=-v>")
 add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--ptxas-options=-v>")
 
+# ── Debug 与 Release 模式的完整对比 ─────────────────────────────────────────
+# cmake -DCMAKE_BUILD_TYPE=Debug   → 调试构建
+# cmake -DCMAKE_BUILD_TYPE=Release → 发布构建
+#
+# 编译器标志差异：
+#   Debug  ：-O0（不优化）-g（主机调试符号）-G（GPU 调试符号）
+#   Release：-O2/-O3（全力优化）-lineinfo（仅保留行号，供 ncu 分析）
+#
+# NDEBUG 宏：
+#   Debug  ：不定义 NDEBUG → assert() 正常启用
+#   Release：自动定义 NDEBUG → assert() 被预处理器展开为 ((void)0)，
+#            完全移除，不产生任何指令，越界访问静默发生，得到错误结果而不报错
+#            这也是 Divergence! 出现时有时看不到 assert 信息的原因
+#
+# assert 与 fprintf(stderr) 的行为差异：
+#
+#   assert()：
+#     Debug  ：GPU 线程触发 → 写入 GPU 缓冲区 → 同步点刷新 → stderr（详细信息）
+#              然后 cudaDeviceSynchronize() 返回 cudaErrorAssert，
+#              cudaCheck 再调用 fprintf(stderr, "device-side assert triggered")
+#              → 终端共出现两条错误：一条详细（assert 内容），一条通用（cudaCheck）
+#     Release：assert 被移除，两条错误都不出现，程序继续执行得到错误结果
+#
+#   fprintf(stderr, ...)（如 cudaCheck 内部）：
+#     Debug  ：正常打印到 stderr ✓
+#     Release：正常打印到 stderr ✓
+#     与 NDEBUG 无关，两种模式行为完全相同
+#
+# stderr 在脚本中的去向（run_all_kernels.sh：2>&1 | tee -a error.txt）：
+#   stderr（fd 2）被 2>&1 合并到 stdout（fd 1，管道写端），
+#   tee 从管道读取后同时写到终端和 error.txt；
+#   无论 Debug 还是 Release，fprintf(stderr) 的输出都会落入 error.txt，
+#   区别仅在于 assert 信息在 Release 下不存在。
+
 # aux_source_directory(<目录> <变量>)：扫描指定目录下的所有源文件，将路径列表存入变量
 #   - ${PROJECT_SOURCE_DIR} : CMake 内置变量，指向 project() 所在的根目录（即本文件所在目录）
 #   - ${PROJECT_SOURCE_DIR}/src : 即 <项目根>/src/，存放各 kernel 实现的 .cu / .cpp 文件

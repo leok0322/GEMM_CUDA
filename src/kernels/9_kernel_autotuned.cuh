@@ -313,6 +313,22 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
   //       实际访问 DRAM 频率高于 2048，导致等效带宽略低，GFLOP/s 小幅下降。
   // ────────────────────────────────────────────────────────────────────────────
 
+  // ── 增大 BK 的收益与 compute-bound 的关系 ─────────────────────────────────────
+  //
+  // Autotuner 最优参数 BK=16（kernel 8 使用 BK=8），性能提升来自摊薄同步开销，而非算术强度：
+  //   算术强度 = 2×BM×BN×BK / ((BM+BN)×BK×4) = 2×BM×BN / ((BM+BN)×4)，BK 约分消去
+  //   BK 对算术强度无影响，收益来自：K/BK 次外层循环减少 → __syncthreads() 调用次数减半
+  //   每次迭代有效计算量翻倍，同步固定开销占比下降 → 执行时间缩短
+  //
+  // 这说明 kernel 未达到真正的 compute-bound：
+  //   kernel 7：FMA 掩盖 SMEM bank conflict → SMEM 延迟不是瓶颈（局部结论）
+  //   kernel 9：增大 BK 仍有收益 → 同步开销仍占一定比例 → 全局未达峰值 FLOPS
+  //   两者不矛盾：前者只说明 SMEM 层不是瓶颈，后者揭示了另一层（同步）仍有优化空间
+  //
+  // 真正的 compute-bound：任何层次优化（内存布局、同步频率、参数调整）均无法继续提升，
+  //   FPU 利用率接近 100%，需用 ncu 查看 sm_active_cycles 等计数器验证。
+  // ────────────────────────────────────────────────────────────────────────────
+
 template <const int BM,const int BN, const int BK, const int TM,const int TN>
 __global__ void __launch_bounds__(K9_NUM_THREADS,1) gemmAutotuned_v2 (int M, int N, int K, float alpha, float *A, float *B,
                    float beta, float *C) {

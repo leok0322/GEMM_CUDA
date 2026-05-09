@@ -246,6 +246,10 @@ kernel_7：[────加载（2-way + ×4 指令）────]──sync─
 | Kernel 6 | STS.128 phase → 0 conflict，1 条指令 | 4-way（FMA 掩盖 ≈ 0） | 4699 GFLOPS |
 | Kernel 7 | 4×STS.32，2-way conflict，4 条指令 | 无 conflict（收益 ≈ 0）| 4377 GFLOPS |
 
+**关于 compute-bound 的推断（局部 vs 全局）**
+
+FMA 掩盖 Bs 读 conflict → SMEM 延迟不是瓶颈，但这只是**局部结论**：某一层的延迟被隐藏 ≠ 整体达到峰值 FLOPS 的真正 compute-bound。Kernel 9 中 autotuner 将 BK 从 8 提升到 16 仍有性能提升，说明同步开销仍是瓶颈，证明此处尚未达到全局 compute-bound。
+
 ---
 
 ### Kernel 8：Bs SMEM Padding（正确消除 Bs Bank Conflict）
@@ -343,6 +347,12 @@ Autotuned 最优参数（本机 sm_86）：
 - Kernel 9（`gemmAutotuned_v2`）：加载 As 使用单条无条件 float4 load，代码路径唯一，编译器可充分展开、重排、合并，生成指令数最少。
 
 去掉 kernel 8 的边界检查后两者性能应接近一致。
+
+**增大 BK 的收益与 compute-bound**
+
+Autotuner 最优参数 BK=16（vs kernel 8 的 BK=8）。增大 BK 并不改变算术强度（BK 在公式中约分消去），收益来自摊薄 `__syncthreads()` 开销：循环次数减半，每次迭代有效计算量翻倍，同步固定开销占比下降。
+
+这说明 kernel 仍有非计算开销可优化，**未达真正 compute-bound**——与 kernel 7 中 FMA 掩盖的结论不矛盾：kernel 7 只说明 SMEM 层不是瓶颈，kernel 9 增大 BK 有收益则揭示了另一层（同步）仍有空间。真正的 compute-bound 是任何层次的优化均无法继续提升性能，FPU 利用率接近 100%。
 
 **为何 4096 性能低于 2048**
 

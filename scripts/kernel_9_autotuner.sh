@@ -258,7 +258,7 @@ for bk in ${BK_VALUES[@]}; do
             #                   注意：终端上的 "Running kernel 9 on device 0." 来自 printf（stdout），
             #                   不是 fs << "Running kernel..."（两处写了内容相同的字符串，目标不同）。
             # 超过10秒的就不计入统计
-            timeout -v 10 ./cmake-build-release/gemm 9 | tee -a $OUTPUT
+            timeout -v 10 ./cmake-build-release/gemm 9  2>&1 | tee -a $OUTPUT
             echo "-------------------" | tee -a $OUTPUT
             echo "" | tee -a $OUTPUT
           done

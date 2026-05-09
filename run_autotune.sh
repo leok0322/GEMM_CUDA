@@ -1,2 +1,4 @@
 #!/usr/bin/env bash
-bash "$(dirname "$0")/scripts/kernel_9_autotuner.sh"
+for i in $(seq 9 9); do
+  bash "$(dirname "$0")/scripts/kernel_${i}_autotuner.sh"
+done

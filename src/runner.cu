@@ -1288,7 +1288,9 @@ void rungemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
   //              若初始化值不是编译期常量则直接编译报错，比 const 更安全
   //   此处用 const 是 C 风格习惯写法，字面量初始化保证了编译期性质；
   //   现代 C++ 推荐改写为 constexpr，明确表达意图。
-  const uint K9_BK = 8;
+
+  // 最佳参数组合
+  const uint K9_BK = 16;
   const uint K9_TM = 8;
   const uint K9_TN = 8;
   const uint K9_BM = 128;

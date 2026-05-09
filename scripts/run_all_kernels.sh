@@ -13,7 +13,7 @@
 PROJECT_ROOT="$(realpath "$(dirname "$0")/..")"
 BINARY="$PROJECT_ROOT/cmake-build-release/gemm"
 OUTPUT_DIR="$PROJECT_ROOT/benchmark_results"
-ERROR_LOG_DIR="$PROJECT_ROOT/error_logs"
+ERROR_LOG_DIR="$PROJECT_ROOT/logs"
 
 # mkdir -p：递归创建目录，已存在则不报错（幂等）
 mkdir -p "$OUTPUT_DIR"
@@ -98,8 +98,8 @@ for i in $(seq 9 9); do
 
     # DEVICE=0 "$BINARY" "$i" 2> "$ERROR_LOG_DIR/kernel${i}_error.txt"
     # DEVICE=0 "$BINARY" "$i"  2> >(tee  -a "$ERROR_LOG_DIR/kernel${i}_error.txt" >&2) | tee -a "$OUTPUT_DIR/kernel${i}_result.txt"
-    DEVICE=0 "$BINARY" "$i" 2>&1 | tee -a "$ERROR_LOG_DIR/kernel${i}_error.txt"
-    echo "  -> errors: $ERROR_LOG_DIR/kernel${i}_error.txt"
+    DEVICE=0 "$BINARY" "$i" 2>&1 | tee -a "$ERROR_LOG_DIR/kernel_${i}_error.txt"
+    echo "  -> errors: $ERROR_LOG_DIR/kernel_${i}_error.txt"
 done
 
 echo "Done. Results in $OUTPUT_DIR/"

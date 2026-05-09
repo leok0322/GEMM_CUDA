@@ -34,7 +34,7 @@ cd ".."
 # 需要被 sed 原地修改的源文件路径
 RUNNER="src/runner.cu"
 KERNEL="src/kernels/9_kernel_autotuned.cuh"
-OUTPUT="benchmark_results/kernel_9_autotune_results.txt"
+OUTPUT="autotune/kernel_9_autotune_results.txt"
 
 # 清空结果文件，避免将本次结果追加到上一次残留数据之后
 # >  覆盖写（截断）：打开文件时先将文件截断为 0 字节，再写入，原有内容全部丢失
@@ -42,6 +42,7 @@ OUTPUT="benchmark_results/kernel_9_autotune_results.txt"
 # |  管道          ：目标不是文件，而是另一个进程的 stdin；
 #                   数据存在内核缓冲区（内存），进程结束即消失，从不落盘；
 #                   无覆盖/追加的概念，> / >> 是 stdout→文件，| 是 stdout→stdin
+mkdir -p "$(dirname "$OUTPUT")"
 echo "" > $OUTPUT
 
 # 指定使用哪块 GPU，通过环境变量而非 argv 传递：

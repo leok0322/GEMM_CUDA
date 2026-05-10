@@ -1289,7 +1289,7 @@ void rungemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
   //   此处用 const 是 C 风格习惯写法，字面量初始化保证了编译期性质；
   //   现代 C++ 推荐改写为 constexpr，明确表达意图。
 
-  // 最佳参数组合
+  // SM86最佳参数组合
   const uint K9_BK = 16;
   const uint K9_TM = 8;
   const uint K9_TN = 8;
@@ -1378,7 +1378,7 @@ void rungemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
   cudaCheck(cudaGetLastError());
 }
 
-void runSgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
+void rungemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
                         float beta, float *C) {
   // Settings for A100
   // const uint K10_NUM_THREADS = 128;
@@ -1434,7 +1434,7 @@ void runSgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
                 "BN*BK must be a multiple of 4*256 to vectorize loads");
 
   dim3 gridDim(CEIL_DIV(N, K10_BN), CEIL_DIV(M, K10_BM));
-  sgemmWarptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
+  gemmWarptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
                   K10_TN, K10_NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
@@ -1507,7 +1507,6 @@ void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
 void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
                               float *B, float beta, float *C) {
   // Settings for A6000
-  const uint K12_NUM_THREADS = 128;
   const uint K12_BN = 128;
   const uint K12_BM = 128;
   const uint K12_BK = 16;
@@ -1609,7 +1608,7 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     rungemmAutotuned(M, N, K, alpha, A, B, beta, C);
     break;
   case 10:
-    runSgemmWarptiling(M, N, K, alpha, A, B, beta, C);
+    rungemmWarptiling(M, N, K, alpha, A, B, beta, C);
     break;
   case 11:
     runSgemmDoubleBuffering(M, N, K, alpha, A, B, beta, C);

@@ -102,10 +102,17 @@
 //     净效果：写入劣化（硬代价） > 读取优化（≈0 收益） → kernel_7 反而慢
 //
 //   ⑥ 关于 compute-bound 的推断（局部 vs 全局）：
-//     FMA 掩盖 Bs 读 conflict → SMEM 延迟在该 kernel 中不是瓶颈
-//     但这只是局部结论：SMEM 层延迟被隐藏 ≠ 整体达到峰值 FLOPS 的真正 compute-bound
-//     kernel 9 autotuner 将 BK 从 8 提升到 16 后性能仍有提升，说明同步开销仍是瓶颈，
-//     证明 kernel 7/8 尚未达到全局 compute-bound
+//     FMA 掩盖 Bs 读 conflict → SMEM 延迟在计算阶段内不是瓶颈
+//     但这只是局部结论：FMA masking 的作用范围仅限于相邻两次 __syncthreads() 之间的计算阶段，
+//     __syncthreads() 是 block 级屏障，block 内所有 warp 全部停止，warp 切换在此失效，
+//     FPU 在屏障处真正空转——FMA masking 再好也无法填补这段空转。
+//
+//     [──计算阶段（FMA masking SMEM stall）──]──sync（FPU 空转）──[──计算阶段──]──sync──...
+//                ↑ FMA masking 作用范围              ↑ 与 FMA masking 不重叠，是独立瓶颈
+//
+//     kernel 9 增大 BK（8→16）减少 sync 屏障频率，性能仍有提升，说明 sync 开销仍是瓶颈；
+//     4096 维度时 L2 命中率下降导致 GMEM 带宽又是第三层独立瓶颈。
+//     三层瓶颈（SMEM 延迟 / sync 开销 / GMEM 带宽）相互独立，共同说明尚未达到全局 compute-bound。
 //
 //   ┌──────────────┬──────────────────────────────┬──────────────────────┬──────────────┐
 //   │              │ Bs 写入（加载阶段）          │ Bs 读（计算阶段）    │ 实测         │

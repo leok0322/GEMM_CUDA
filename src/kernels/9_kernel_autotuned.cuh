@@ -313,13 +313,17 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
   //       实际访问 DRAM 频率高于 2048，导致等效带宽略低，GFLOP/s 小幅下降。
   //
   // 【4096 性能下降说明未达 compute-bound】
-  //   4096 时性能下降的原因是 L2 命中率下降（带宽受限），而非撞上了 FPU 的天花板。
+  //   4096 时性能下降的原因是 L2 命中率下降（GMEM 带宽受限），而非撞上了 FPU 的天花板。
   //   更具体地说：在算术强度（BK 约分，无法提升）和 FPU 利用效率均无任何改善的前提下，
   //   矩阵尺寸从 2048 增大到 4096 唯一改变的是 L2 命中率下降（数据量远超 6 MB L2），
   //   等效可用带宽降低，导致 GFLOPS 小幅下滑。
+  //   这是第三层独立瓶颈（GMEM 带宽），与 SMEM 延迟、sync 开销均不重叠：
+  //     SMEM 延迟  → FMA masking 隐藏（kernel 7 结论）
+  //     sync 开销  → 增大 BK 摊薄（本节结论）
+  //     GMEM 带宽  → 算术强度受限，L2 命中率下降进一步压低等效带宽（本节结论）
   //   kernel 10 在 4096 维度上仍能进一步提升 GFLOPS，证明 FPU 仍有空缺未被填满。
   //   若已达真正 compute-bound，kernel 10 的任何优化均无法提升性能。
-  //   两个现象合在一起，确认整个优化序列此时尚未达到真正的 compute-bound。
+  //   三层瓶颈共同确认整个优化序列此时尚未达到真正的 compute-bound。
   // ────────────────────────────────────────────────────────────────────────────
 
   // ── 增大 BK 的收益与 compute-bound 的关系 ─────────────────────────────────────
@@ -329,10 +333,14 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
   //   BK 对算术强度无影响，收益来自：K/BK 次外层循环减少 → __syncthreads() 调用次数减半
   //   每次迭代有效计算量翻倍，同步固定开销占比下降 → 执行时间缩短
   //
-  // 这说明 kernel 未达到真正的 compute-bound：
-  //   kernel 7：FMA 掩盖 SMEM bank conflict → SMEM 延迟不是瓶颈（局部结论）
-  //   kernel 9：增大 BK 仍有收益 → 同步开销仍占一定比例 → 全局未达峰值 FLOPS
-  //   两者不矛盾：前者只说明 SMEM 层不是瓶颈，后者揭示了另一层（同步）仍有优化空间
+  // 与 kernel 7 的 FMA masking 结论不矛盾，两者作用阶段完全不重叠：
+  //   FMA masking：作用于计算阶段内部（两次 sync 之间），SMEM stall → warp 切换 → FPU 持续有活干
+  //   sync 开销  ：作用于屏障处，block 内所有 warp 全部停止，warp 切换失效，FPU 真正空转
+  //
+  //   [──计算阶段（FMA masking 有效）──]──sync（FPU 空转，BK 优化作用于此）──[──计算阶段──]──...
+  //
+  //   FMA masking 效果好 ≠ sync 开销可忽略：两者独立，可以同时存在。
+  //   增大 BK 减少 sync 频率，说明 sync 开销在 BK=8 时仍占一定比例 → 未达全局 compute-bound。
   //
   // 真正的 compute-bound：任何层次优化（内存布局、同步频率、参数调整）均无法继续提升，
   //   FPU 利用率接近 100%，需用 ncu 查看 sm_active_cycles 等计数器验证。

@@ -1380,62 +1380,106 @@ void rungemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
 
 void rungemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
                         float beta, float *C) {
-  // Settings for A100
+  // Settings for SM86
+  // v1
   // const uint K10_NUM_THREADS = 128;
   // const uint K10_BN = 128;
-  // const uint K10_BM = 64;
+  // const uint K10_BM = 128;
   // const uint K10_BK = 16;
   // const uint K10_WN = 64;
-  // const uint K10_WM = 32;
-  // const uint K10_WNITER = 1;
+  // const uint K10_WM = 64;
+  // const uint K10_WNITER = 4;
   // const uint K10_TN = 4;
-  // const uint K10_TM = 4;
-  // Settings for A6000
-  const uint K10_NUM_THREADS = 128;
+  // const uint K10_TM = 8;
+
+  // v2
   const uint K10_BN = 128;
   const uint K10_BM = 128;
-  const uint K10_BK = 16;
+  const uint K10_BK = 8;
   const uint K10_WN = 64;
-  const uint K10_WM = 64;
-  const uint K10_WNITER = 4;
+  const uint K10_WM = 32;
   const uint K10_TN = 4;
-  const uint K10_TM = 8;
+  const uint K10_TM = 4;
   dim3 blockDim(K10_NUM_THREADS);
 
-  constexpr uint NUM_WARPS = K10_NUM_THREADS / 32;
+  // V1
+  // constexpr uint NUM_WARPS = K10_NUM_THREADS / 32;
+  // // warptile in threadblocktile
+  // static_assert((K10_BN % K10_WN == 0) and (K10_BM % K10_WM == 0));
+  // static_assert((K10_BN / K10_WN) * (K10_BM / K10_WM) == NUM_WARPS);
+  //
+  // // threads in warpsubtile
+  // static_assert((K10_WM * K10_WN) % (WARPSIZE * K10_TM * K10_TN * K10_WNITER) ==
+  //               0);
+  // constexpr uint K10_WMITER =
+  //     (K10_WM * K10_WN) / (32 * K10_TM * K10_TN * K10_WNITER);
+  // // warpsubtile in warptile
+  // static_assert((K10_WM % K10_WMITER == 0) and (K10_WN % K10_WNITER == 0));
+  //
+  // static_assert((K10_NUM_THREADS * 4) % K10_BK == 0,
+  //               "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization "
+  //               "issues during GMEM->SMEM tiling (loading only parts of the "
+  //               "final row of Bs during each iteraion)");
+  // static_assert((K10_NUM_THREADS * 4) % K10_BN == 0,
+  //               "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization "
+  //               "issues during GMEM->SMEM tiling (loading only parts of the "
+  //               "final row of As during each iteration)");
+  // static_assert(K10_BN % (16 * K10_TN) == 0,
+  //               "BN must be a multiple of 16*TN to avoid quantization effects");
+  // static_assert(K10_BM % (16 * K10_TM) == 0,
+  //               "BM must be a multiple of 16*TM to avoid quantization effects");
+  // static_assert((K10_BM * K10_BK) % (4 * K10_NUM_THREADS) == 0,
+  //               "BM*BK must be a multiple of 4*256 to vectorize loads");
+  // static_assert((K10_BN * K10_BK) % (4 * K10_NUM_THREADS) == 0,
+  //               "BN*BK must be a multiple of 4*256 to vectorize loads");
+  //
+  // dim3 gridDim(CEIL_DIV(N, K10_BN), CEIL_DIV(M, K10_BM));
+  // gemmWarptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
+  //                 K10_TN, K10_NUM_THREADS>
+  //     <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  // // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
+  // cudaCheck(cudaGetLastError());
 
-  // warptile in threadblocktile
-  static_assert((K10_BN % K10_WN == 0) and (K10_BM % K10_WM == 0));
-  static_assert((K10_BN / K10_WN) * (K10_BM / K10_WM) == NUM_WARPS);
+  // V2
+  // 加载阶段
+  // 该线程负责加载的As和Bs的行组和列
+  // As
+  static_assert(K10_BK % 4 == 0 && "向量加载As的列组不是整数");
+  // 暗含了K12_NUM_THREADS不能小于(BK / 4)
+  static_assert(K10_NUM_THREADS % (K10_BK / 4) == 0 && "block不能覆盖完整的列组");
+  static_assert(K10_BM * K10_BK % (K10_NUM_THREADS * 4) == 0 && "block不能覆盖完整的行");
+  // 两者等价
+  // % 和 / 优先级相同，从左到右结合，实际被解析为 (BM % K10_NUM_THREADS) / (BK/4) == 0，不是预期的 BM % (K10_NUM_THREADS / (BK/4)) == 0，需加括号。
+  static_assert(K10_BM % (K10_NUM_THREADS / (K10_BK / 4)) == 0 && "block在n次迭代中不能覆盖完整的行");
 
-  // threads in warpsubtile
-  static_assert((K10_WM * K10_WN) % (WARPSIZE * K10_TM * K10_TN * K10_WNITER) ==
-                0);
-  constexpr uint K10_WMITER =
-      (K10_WM * K10_WN) / (32 * K10_TM * K10_TN * K10_WNITER);
-  // warpsubtile in warptile
-  static_assert((K10_WM % K10_WMITER == 0) and (K10_WN % K10_WNITER == 0));
+  //Bs
+  static_assert(K10_BN % 4 == 0 && "向量加载的Bs列组不是整数");
+  // 暗含了K12_NUM_THREADS不能小于(BK / 4)
+  static_assert(K10_NUM_THREADS % (K10_BN / 4) == 0 && "block不能覆盖完整的列组");
+  static_assert(K10_BN * K10_BK % (K10_NUM_THREADS * 4) == 0 && "block不能覆盖完整的行");
+  // 两者等价
+  static_assert(K10_BK % (K10_NUM_THREADS / (K10_BN / 4)) == 0 && "block在n次迭代中不能覆盖完整的行");
 
-  static_assert((K10_NUM_THREADS * 4) % K10_BK == 0,
-                "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization "
-                "issues during GMEM->SMEM tiling (loading only parts of the "
-                "final row of Bs during each iteraion)");
-  static_assert((K10_NUM_THREADS * 4) % K10_BN == 0,
-                "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization "
-                "issues during GMEM->SMEM tiling (loading only parts of the "
-                "final row of As during each iteration)");
-  static_assert(K10_BN % (16 * K10_TN) == 0,
-                "BN must be a multiple of 16*TN to avoid quantization effects");
-  static_assert(K10_BM % (16 * K10_TM) == 0,
-                "BM must be a multiple of 16*TM to avoid quantization effects");
-  static_assert((K10_BM * K10_BK) % (4 * K10_NUM_THREADS) == 0,
-                "BM*BK must be a multiple of 4*256 to vectorize loads");
-  static_assert((K10_BN * K10_BK) % (4 * K10_NUM_THREADS) == 0,
-                "BN*BK must be a multiple of 4*256 to vectorize loads");
+  // 计算阶段
+  // 暗含BM要大于WM
+  static_assert(K10_BM % K10_WM == 0 && "经过n次迭代，能覆盖完整的BM");
+  // 暗含BN要大于WN
+  static_assert(K10_BN % K10_WN == 0 && "经过n次迭代，能覆盖完整的BM");
+  // 暗含WN大于TN
+  static_assert(K10_WN % K10_TN == 0 && "列组不是整数");
+  // 暗含WM大于TM
+  static_assert(K10_WM % K10_TM == 0 && "行组不是整数");
+  static_assert(K10_NUM_THREADS % (K10_WN / K10_TN) == 0 && "block不能覆盖完整列组");
+  // 暗含WM要大于K10_NUM_THREADS / (WN / TN) * TM，即大于threadrowNumPerIter，threadRowIterNum永远不会是0
+  static_assert(K10_WM % (K10_NUM_THREADS / (K10_WN / K10_TN) * K10_TM) == 0 && "block在n次迭代中不能覆盖完整行组，需要处理边界情况");
+  // 等价于
+  static_assert((K10_WM * K10_WN) % (K10_NUM_THREADS * K10_TM * K10_TN) == 0);
+
+  static_assert(K10_TN % 4 == 0 && "列组不是整数");
 
   dim3 gridDim(CEIL_DIV(N, K10_BN), CEIL_DIV(M, K10_BM));
-  gemmWarptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
-                  K10_TN, K10_NUM_THREADS>
+  gemmWarptiling_v2<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_TM,
+                  K10_TN>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
   cudaCheck(cudaGetLastError());
@@ -1507,6 +1551,7 @@ void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
 void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
                               float *B, float beta, float *C) {
   // Settings for A6000
+  const uint K12_NUM_THREADS = 128;
   const uint K12_BN = 128;
   const uint K12_BM = 128;
   const uint K12_BK = 16;
@@ -1531,11 +1576,11 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
   // warpsubtile in warptile
   static_assert((K12_WM % K12_WMITER == 0) and (K12_WN % K12_WNITER == 0));
 
-  static_assert((K12_NUM_THREADS * 4) % K12_BK == 0,
+  static_assert((K10_NUM_THREADS * 4) % K12_BK == 0,
                 "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization "
                 "issues during GMEM->SMEM tiling (loading only parts of the "
                 "final row of Bs during each iteraion)");
-  static_assert((K12_NUM_THREADS * 4) % K12_BN == 0,
+  static_assert((K10_NUM_THREADS * 4) % K12_BN == 0,
                 "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization "
                 "issues during GMEM->SMEM tiling (loading only parts of the "
                 "final row of As during each iteration)");
@@ -1543,9 +1588,9 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
                 "BN must be a multiple of 16*TN to avoid quantization effects");
   static_assert(K12_BM % (16 * K12_TM) == 0,
                 "BM must be a multiple of 16*TM to avoid quantization effects");
-  static_assert((K12_BM * K12_BK) % (4 * K12_NUM_THREADS) == 0,
+  static_assert((K12_BM * K12_BK) % (4 * K10_NUM_THREADS) == 0,
                 "BM*BK must be a multiple of 4*256 to vectorize loads");
-  static_assert((K12_BN * K12_BK) % (4 * K12_NUM_THREADS) == 0,
+  static_assert((K12_BN * K12_BK) % (4 * K10_NUM_THREADS) == 0,
                 "BN*BK must be a multiple of 4*256 to vectorize loads");
 
   dim3 gridDim(CEIL_DIV(N, K12_BN), CEIL_DIV(M, K12_BM));
@@ -1567,7 +1612,7 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
   // 对比普通函数：普通函数定义即编译，无论是否被调用，警告都会出现
   // 模板函数：按需编译，注释掉唯一的调用点，等价于让整段模板代码从未存在
   runSgemmDoubleBuffering2<K12_BM, K12_BN, K12_BK, K12_WM, K12_WN, K12_WNITER,
-                           K12_TM, K12_TN, K12_NUM_THREADS>
+                           K12_TM, K12_TN, K10_NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   // 先检查 kernel 启动错误（参数非法、资源不足等，同步，立即可知）
   cudaCheck(cudaGetLastError());

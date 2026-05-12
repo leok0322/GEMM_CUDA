@@ -8,6 +8,14 @@ C = α × (A @ B) + β × C
 
 ---
 
+## 性能折线图
+
+![CUDA GEMM Kernel Performance](performance_plot.png)
+
+> 使用 `uv run plot_performance.py` 生成，可传入指定维度，例如 `uv run plot_performance.py 512 1024 2048 4096`。
+
+---
+
 ## 性能汇总（矩阵维度 4096）
 
 | 内核 | 描述 | GFLOPS | vs cuBLAS |

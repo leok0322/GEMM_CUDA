@@ -13,6 +13,7 @@
 """
 
 import argparse
+import base64
 import re
 import sys
 from pathlib import Path
@@ -98,40 +99,66 @@ def main():
         print("错误：没有找到任何结果文件", file=sys.stderr)
         sys.exit(1)
 
-    fig, ax = plt.subplots(figsize=(12, 7))
+    # X 轴为 kernel 1-10，每条折线代表一个矩阵维度
+    plot_kernels = list(range(1, 11))
+    # tab10 调色板提供 10 种区分度高的颜色，每个维度一种
+    colors = [plt.cm.tab10(i) for i in range(len(dims))]
 
-    for kid, results in data.items():
-        # results.get(d) 在该 kernel 没有某维度数据时返回 None
-        y = [results.get(d) for d in dims]
-        # 过滤掉 None，只绘制有数据的点；某 kernel 在部分维度缺测时折线自动断开
-        valid = [(d, v) for d, v in zip(dims, y) if v is not None]
+    fig, ax = plt.subplots(figsize=(13, 7))
+
+    for i, dim in enumerate(dims):
+        color = colors[i]
+        ys = [data.get(kid, {}).get(dim) for kid in plot_kernels]
+        # 过滤掉 None（该 kernel 无此维度数据），折线在缺失处自动断开
+        valid = [(kid, v) for kid, v in zip(plot_kernels, ys) if v is not None]
         if not valid:
             continue
-        xs, ys = zip(*valid)
+        xs, ys_valid = zip(*valid)
+        ax.plot(xs, ys_valid, label=f"{dim}×{dim}", marker="o",
+                linewidth=1.8, markersize=5, color=color)
 
-        style = dict(marker="o", linewidth=1.8, markersize=5)
-        # cuBLAS（kid=0）用虚线灰色加粗，作为性能上限参考基线
-        if kid == 0:
-            style.update(linewidth=2.2, linestyle="--", color="gray", markersize=6)
+        # cuBLAS 基准：与该维度同色的水平虚线，方便直接对比每个 kernel 与 cuBLAS 的差距
+        cublas = data.get(0, {}).get(dim)
+        if cublas is not None:
+            ax.axhline(cublas, linestyle="--", linewidth=1.0, color=color, alpha=0.5)
 
-        ax.plot(xs, ys, label=KERNEL_LABELS[kid], **style)
-
-    ax.set_xlabel("Matrix Dimension (m=n=k)", fontsize=12)
+    ax.set_xlabel("Kernel", fontsize=12)
     ax.set_ylabel("Performance (GFLOPS)", fontsize=12)
     ax.set_title("CUDA GEMM Kernel Performance", fontsize=14)
-    # X 轴只在实际维度处打刻度，避免线性插值出现无意义的中间值
-    ax.set_xticks(dims)
-    ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: str(int(x))))
+    # X 轴刻度：kernel 编号，标签使用简短名称，旋转避免重叠
+    ax.set_xticks(plot_kernels)
+    ax.set_xticklabels([KERNEL_LABELS[k] for k in plot_kernels], rotation=25, ha="right")
     # Y 轴千位分隔符，方便读大数值
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
-    ax.legend(loc="upper left", fontsize=9, ncol=2)
+    # 图例：实线=各维度折线；在图例末尾加一条灰色虚线说明 cuBLAS 基准含义
+    handles, labels = ax.get_legend_handles_labels()
+    from matplotlib.lines import Line2D
+    handles.append(Line2D([0], [0], linestyle="--", linewidth=1.0, color="gray", alpha=0.7))
+    labels.append("cuBLAS baseline")
+    ax.legend(handles, labels, loc="upper left", fontsize=9, ncol=2)
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.set_ylim(bottom=0)  # Y 轴从 0 开始，避免视觉上夸大差距
 
     plt.tight_layout()
-    out = Path(__file__).parent / "benchmark_results" / "performance_plot.png"
+    out = Path(__file__).parent / "performance_plot.png"
     plt.savefig(out, dpi=150)
     print(f"已保存：{out}")
+
+    # 将图片以 base64 内联写入 README.md，替换 ![...](...) 引用行
+    # 注意：data: URI 在本地 Markdown 渲染器（VS Code 等）正常显示，GitHub 不渲染
+    readme = Path(__file__).parent / "README.md"
+    if readme.exists():
+        b64 = base64.b64encode(out.read_bytes()).decode()
+        inline_tag = f"![CUDA GEMM Kernel Performance](data:image/png;base64,{b64})"
+        # 替换形如 ![CUDA GEMM Kernel Performance](...) 的行（无论括号内是路径还是旧 base64）
+        updated = re.sub(
+            r"!\[CUDA GEMM Kernel Performance\]\([^)]*\)",
+            inline_tag,
+            readme.read_text(),
+        )
+        readme.write_text(updated)
+        print(f"已更新：{readme}")
+
     plt.show()
 
 

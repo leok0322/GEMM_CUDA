@@ -13,7 +13,6 @@
 """
 
 import argparse
-import base64
 import re
 import sys
 from pathlib import Path
@@ -144,17 +143,16 @@ def main():
     plt.savefig(out, dpi=150)
     print(f"已保存：{out}")
 
-    # 将图片以 base64 内联写入 README.md，替换 ![...](...) 引用行
-    # 注意：data: URI 在本地 Markdown 渲染器（VS Code 等）正常显示，GitHub 不渲染
+    # 用图片相对路径替换 README.md 中 <!-- performance_plot --> 标记之间的内容
     readme = Path(__file__).parent / "README.md"
     if readme.exists():
-        b64 = base64.b64encode(out.read_bytes()).decode()
-        inline_tag = f"![CUDA GEMM Kernel Performance](data:image/png;base64,{b64})"
-        # 替换形如 ![CUDA GEMM Kernel Performance](...) 的行（无论括号内是路径还是旧 base64）
+        img_rel = out.relative_to(Path(__file__).parent)  # 相对于 README 所在目录的路径
+        new_block = f"<!-- performance_plot -->\n![CUDA GEMM Kernel Performance]({img_rel})\n<!-- performance_plot -->"
         updated = re.sub(
-            r"!\[CUDA GEMM Kernel Performance\]\([^)]*\)",
-            inline_tag,
-            readme.read_text(),
+            r"<!-- performance_plot -->.*<!-- performance_plot -->",
+            new_block,
+            readme.read_text(),  # 传入完整 README 文本作为匹配目标
+            flags=re.DOTALL,     # 默认 . 不匹配 \n；re.DOTALL 让 . 匹配包括换行在内的任意字符，从而跨行匹配两个标记之间的旧内容
         )
         readme.write_text(updated)
         print(f"已更新：{readme}")

@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
         //   std::exception 是所有标准异常的基类，捕获基类引用可接住所有标准异常
         //   const &：引用避免拷贝，const 保证不修改异常对象
         //   e.what()：虚函数，多态调用到具体子类实现，返回异常描述字符串
-        printf("%s\n", e.what());
+        fprintf(stderr,"%s\n", e.what());
         exit(EXIT_FAILURE);
       }
       cudaMemcpy(C, dC, sizeof(float) * m * n, cudaMemcpyDeviceToHost);
